@@ -1,0 +1,11 @@
+build/
+managed_components/
+
+# Local editor settings
+.vscode/
+
+# ESP-IDF local/generated files
+sdkconfig.old
+*.elf
+*.bin
+*.map
