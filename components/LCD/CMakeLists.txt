@@ -1,5 +1,6 @@
-set(src_dirs
-            .)
+set(srcs
+            lcd.c
+            lv_font_chinese_20.c)
 
 set(include_dirs
             include)
@@ -11,7 +12,7 @@ set(requires
             esp_timer
             lvgl)
 
-idf_component_register(SRC_DIRS ${src_dirs}
+idf_component_register(SRCS ${srcs}
                       INCLUDE_DIRS ${include_dirs}
                       REQUIRES ${requires})
 

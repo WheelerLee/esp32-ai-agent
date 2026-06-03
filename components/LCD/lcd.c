@@ -15,16 +15,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "lcd_text_bitmap.h"
 #include "lvgl.h"
 
 static const char *TAG = "lcd";
 
+LV_FONT_DECLARE(lv_font_chinese_20);
+
 static esp_lcd_panel_handle_t s_panel_handle;
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t s_disp_drv;
-static lv_obj_t *s_text_canvas;
-static lv_color_t s_text_canvas_buf[LCD_TEXT_BITMAP_WIDTH * LCD_TEXT_BITMAP_HEIGHT];
+static lv_obj_t *s_text_label;
 static SemaphoreHandle_t s_lvgl_mutex;
 static TaskHandle_t s_lvgl_task_handle;
 
@@ -212,34 +212,6 @@ static esp_err_t lvgl_port_init(void)
   return ESP_OK;
 }
 
-static lv_color_t blend_rgb(uint8_t bg_r,
-                            uint8_t bg_g,
-                            uint8_t bg_b,
-                            uint8_t fg_r,
-                            uint8_t fg_g,
-                            uint8_t fg_b,
-                            uint8_t opa)
-{
-  uint8_t inv = 255 - opa;
-  uint8_t r = (bg_r * inv + fg_r * opa) / 255;
-  uint8_t g = (bg_g * inv + fg_g * opa) / 255;
-  uint8_t b = (bg_b * inv + fg_b * opa) / 255;
-
-  return lv_color_make(r, g, b);
-}
-
-static void draw_chinese_text_bitmap(void)
-{
-  for (int y = 0; y < LCD_TEXT_BITMAP_HEIGHT; y++) {
-    for (int x = 0; x < LCD_TEXT_BITMAP_WIDTH; x++) {
-      uint32_t index = y * LCD_TEXT_BITMAP_WIDTH + x;
-      uint8_t alpha = lcd_text_bitmap_alpha[index];
-      s_text_canvas_buf[index] = alpha ? blend_rgb(0xff, 0xff, 0xff, 0x00, 0x00, 0x00, alpha)
-                                       : lv_color_white();
-    }
-  }
-}
-
 esp_err_t lcd_init(void)
 {
   ESP_LOGI(TAG, "initialize ILI9341 on SPI2");
@@ -249,15 +221,17 @@ esp_err_t lcd_init(void)
 
   lvgl_lock();
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_white(), 0);
-  // Draw pre-rendered Chinese text to avoid missing glyphs in LVGL's small CJK demo font.
-  draw_chinese_text_bitmap();
-  s_text_canvas = lv_canvas_create(lv_scr_act());
-  lv_canvas_set_buffer(s_text_canvas,
-                       s_text_canvas_buf,
-                       LCD_TEXT_BITMAP_WIDTH,
-                       LCD_TEXT_BITMAP_HEIGHT,
-                       LV_IMG_CF_TRUE_COLOR);
-  lv_obj_align(s_text_canvas, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+  s_text_label = lv_label_create(lv_scr_act());
+  lv_obj_set_style_bg_opa(s_text_label, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_text_font(s_text_label, &lv_font_chinese_20, 0);
+  lv_obj_set_style_text_color(s_text_label, lv_color_black(), 0);
+  lv_obj_set_style_text_opa(s_text_label, LV_OPA_COVER, 0);
+  lv_label_set_long_mode(s_text_label, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(s_text_label, LCD_H_RES - 20);
+  lv_obj_set_style_text_align(s_text_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(s_text_label, "");
+  lv_obj_align(s_text_label, LV_ALIGN_CENTER, 0, 0);
   lv_obj_invalidate(lv_scr_act());
   lvgl_unlock();
 
@@ -266,11 +240,10 @@ esp_err_t lcd_init(void)
 
 void lcd_show_text(const char *text)
 {
-  (void)text;
   lvgl_lock();
-  draw_chinese_text_bitmap();
-  if (s_text_canvas != NULL) {
-    lv_obj_align(s_text_canvas, LV_ALIGN_CENTER, 0, 0);
+  if (s_text_label != NULL) {
+    lv_label_set_text(s_text_label, text != NULL ? text : "");
+    lv_obj_align(s_text_label, LV_ALIGN_CENTER, 0, 0);
   }
   lv_obj_invalidate(lv_scr_act());
   lvgl_unlock();

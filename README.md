@@ -23,7 +23,7 @@ ILI9341，并使用 LVGL 在屏幕中央显示一行文字。LCD 驱动代码位
 | 色深 | RGB565, 16 bpp |
 | LCD 驱动依赖 | `espressif/esp_lcd_ili9341 ^2.0.2` |
 | LVGL 依赖 | `lvgl/lvgl ~8.3.11` |
-| 中文显示 | 使用 15px 预渲染中文 alpha 位图，白底黑字，避免 LVGL 内置 CJK 字体缺字 |
+| 中文显示 | 使用 `components/LCD/lv_font_chinese_20.c` 中的 LVGL 20px 字体 |
 
 ## ILI9341 接线
 
