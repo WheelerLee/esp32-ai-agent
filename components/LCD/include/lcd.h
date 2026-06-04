@@ -28,6 +28,10 @@
 #define LCD_PIN_NUM_RST GPIO_NUM_15
 #define LCD_PIN_NUM_BK_LIGHT GPIO_NUM_21
 
+// XPT2046 touch controller shares the LCD SPI bus but uses its own CS pin.
+#define LCD_PIN_NUM_TOUCH_CS GPIO_NUM_9
+#define LCD_PIN_NUM_TOUCH_IRQ GPIO_NUM_NC
+
 #define LCD_BK_LIGHT_ON_LEVEL 1
 #define LCD_BK_LIGHT_OFF_LEVEL !LCD_BK_LIGHT_ON_LEVEL
 

@@ -10,6 +10,8 @@
 #include "esp_lcd_ili9341.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_touch.h"
+#include "esp_lcd_touch_xpt2046.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -24,7 +26,10 @@ LV_FONT_DECLARE(lv_font_chinese_16);
 static esp_lcd_panel_handle_t s_panel_handle;
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t s_disp_drv;
+static lv_indev_drv_t s_indev_drv;
 static lv_obj_t *s_text_label;
+static lv_obj_t *s_button;
+static esp_lcd_touch_handle_t s_touch_handle;
 static SemaphoreHandle_t s_lvgl_mutex;
 static TaskHandle_t s_lvgl_task_handle;
 
@@ -74,6 +79,35 @@ static void lvgl_tick_cb(void *arg)
   (void)arg;
   // Keep LVGL's internal time base moving independently of the main task.
   lv_tick_inc(2);
+}
+
+static void button_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+    ESP_LOGI(TAG, "LVGL button clicked");
+  }
+}
+
+static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+{
+  esp_lcd_touch_handle_t touch_handle = (esp_lcd_touch_handle_t)drv->user_data;
+  uint16_t x[1];
+  uint16_t y[1];
+  uint16_t strength[1];
+  uint8_t count = 0;
+
+  data->state = LV_INDEV_STATE_REL;
+  data->continue_reading = false;
+
+  if (touch_handle == NULL || esp_lcd_touch_read_data(touch_handle) != ESP_OK) {
+    return;
+  }
+
+  if (esp_lcd_touch_get_coordinates(touch_handle, x, y, strength, &count, 1) && count > 0) {
+    data->point.x = x[0];
+    data->point.y = y[0];
+    data->state = LV_INDEV_STATE_PR;
+  }
 }
 
 static void lvgl_task(void *arg)
@@ -171,6 +205,46 @@ static esp_err_t lcd_panel_init(void)
   return ESP_OK;
 }
 
+static esp_err_t touch_init(void)
+{
+  esp_lcd_panel_io_handle_t touch_io_handle = NULL;
+  esp_lcd_panel_io_spi_config_t touch_io_config =
+    ESP_LCD_TOUCH_IO_SPI_XPT2046_CONFIG(LCD_PIN_NUM_TOUCH_CS);
+
+  ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_HOST,
+                                               &touch_io_config,
+                                               &touch_io_handle),
+                      TAG,
+                      "create touch panel IO failed");
+
+  esp_lcd_touch_config_t touch_config = {
+    .x_max = LCD_H_RES,
+    .y_max = LCD_V_RES,
+    .rst_gpio_num = GPIO_NUM_NC,
+    .int_gpio_num = LCD_PIN_NUM_TOUCH_IRQ,
+    .flags = {
+      .swap_xy = LCD_SWAP_XY,
+      .mirror_x = LCD_MIRROR_X,
+      .mirror_y = LCD_MIRROR_Y,
+    },
+  };
+
+  ESP_LOGI(TAG, "initialize XPT2046 touch controller");
+  ESP_RETURN_ON_ERROR(esp_lcd_touch_new_spi_xpt2046(touch_io_handle,
+                                                    &touch_config,
+                                                    &s_touch_handle),
+                      TAG,
+                      "initialize XPT2046 failed");
+
+  lv_indev_drv_init(&s_indev_drv);
+  s_indev_drv.type = LV_INDEV_TYPE_POINTER;
+  s_indev_drv.read_cb = touch_read_cb;
+  s_indev_drv.user_data = s_touch_handle;
+  lv_indev_drv_register(&s_indev_drv);
+
+  return ESP_OK;
+}
+
 static esp_err_t lvgl_port_init(void)
 {
   lv_init();
@@ -196,6 +270,7 @@ static esp_err_t lvgl_port_init(void)
   s_disp_drv.draw_buf = &s_disp_buf;
   s_disp_drv.user_data = s_panel_handle;
   lv_disp_drv_register(&s_disp_drv);
+  ESP_RETURN_ON_ERROR(touch_init(), TAG, "touch init failed");
 
   const esp_timer_create_args_t tick_timer_args = {
     .callback = lvgl_tick_cb,
@@ -206,7 +281,7 @@ static esp_err_t lvgl_port_init(void)
   ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer, 2 * 1000), TAG, "start LVGL tick failed");
 
   // The LVGL task runs the timer handler; UI changes from other tasks must lock first.
-  BaseType_t ret = xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 5, &s_lvgl_task_handle);
+  BaseType_t ret = xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 5, &s_lvgl_task_handle);
   ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create LVGL task failed");
 
   return ESP_OK;
@@ -223,6 +298,11 @@ esp_err_t lcd_init(void)
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_white(), 0);
   lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
   s_text_label = lv_label_create(lv_scr_act());
+  if (s_text_label == NULL) {
+    ESP_LOGE(TAG, "create text label failed");
+    lvgl_unlock();
+    return ESP_ERR_NO_MEM;
+  }
   lv_obj_set_style_bg_opa(s_text_label, LV_OPA_TRANSP, 0);
   lv_obj_set_style_text_font(s_text_label, &lv_font_chinese_16, 0);
   lv_obj_set_style_text_color(s_text_label, lv_color_black(), 0);
@@ -232,6 +312,7 @@ esp_err_t lcd_init(void)
   lv_obj_set_style_text_align(s_text_label, LV_TEXT_ALIGN_CENTER, 0);
   lv_label_set_text(s_text_label, "");
   lv_obj_align(s_text_label, LV_ALIGN_CENTER, 0, 0);
+
   lv_obj_invalidate(lv_scr_act());
   lvgl_unlock();
 
@@ -243,8 +324,28 @@ void lcd_show_text(const char *text)
   lvgl_lock();
   if (s_text_label != NULL) {
     lv_label_set_text(s_text_label, text != NULL ? text : "");
-    lv_obj_align(s_text_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(s_text_label, LV_ALIGN_CENTER, 0, -24);
+  }
+  if (s_button == NULL) {
+    s_button = lv_btn_create(lv_scr_act());
+    if (s_button != NULL) {
+      lv_obj_set_size(s_button, 120, 42);
+      lv_obj_add_event_cb(s_button, button_event_cb, LV_EVENT_CLICKED, NULL);
+
+      lv_obj_t *button_label = lv_label_create(s_button);
+      if (button_label != NULL) {
+        lv_obj_set_style_text_font(button_label, &lv_font_chinese_16, 0);
+        lv_label_set_text(button_label, "Click Me");
+        lv_obj_center(button_label);
+      }
+    } else {
+      ESP_LOGE(TAG, "create button failed");
+    }
+  }
+  if (s_button != NULL && s_text_label != NULL) {
+    lv_obj_align_to(s_button, s_text_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 14);
   }
   lv_obj_invalidate(lv_scr_act());
+  lv_timer_handler();
   lvgl_unlock();
 }
