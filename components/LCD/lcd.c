@@ -19,7 +19,7 @@
 
 static const char *TAG = "lcd";
 
-LV_FONT_DECLARE(lv_font_chinese_20);
+LV_FONT_DECLARE(lv_font_chinese_16);
 
 static esp_lcd_panel_handle_t s_panel_handle;
 static lv_disp_draw_buf_t s_disp_buf;
@@ -224,7 +224,7 @@ esp_err_t lcd_init(void)
   lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
   s_text_label = lv_label_create(lv_scr_act());
   lv_obj_set_style_bg_opa(s_text_label, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_text_font(s_text_label, &lv_font_chinese_20, 0);
+  lv_obj_set_style_text_font(s_text_label, &lv_font_chinese_16, 0);
   lv_obj_set_style_text_color(s_text_label, lv_color_black(), 0);
   lv_obj_set_style_text_opa(s_text_label, LV_OPA_COVER, 0);
   lv_label_set_long_mode(s_text_label, LV_LABEL_LONG_WRAP);

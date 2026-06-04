@@ -1,6 +1,6 @@
 set(srcs
             lcd.c
-            lv_font_chinese_20.c)
+            lv_font_chinese_16.c)
 
 set(include_dirs
             include)
