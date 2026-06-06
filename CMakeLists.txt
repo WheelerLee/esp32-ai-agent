@@ -11,3 +11,8 @@ project(lesson1)
 # component, so lower only esp_lcd's optimization level.
 idf_component_get_property(esp_lcd_lib esp_lcd COMPONENT_LIB)
 target_compile_options(${esp_lcd_lib} PRIVATE -O0)
+
+# micro-mp3's bundled OpenCore decoder triggers GCC's maybe-uninitialized
+# analysis under ESP-IDF's project-wide -Werror settings.
+idf_component_get_property(micro_mp3_lib esphome__micro-mp3 COMPONENT_LIB)
+target_compile_options(${micro_mp3_lib} PRIVATE -Wno-error=maybe-uninitialized)

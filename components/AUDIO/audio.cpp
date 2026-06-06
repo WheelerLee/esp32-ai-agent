@@ -1,0 +1,520 @@
+#include "audio.h"
+
+#include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "driver/i2s_std.h"
+#include "esp_check.h"
+#include "esp_http_client.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "micro_mp3/mp3_decoder.h"
+
+static const char *TAG = "audio";
+
+static i2s_chan_handle_t s_i2s_tx_chan;
+static SemaphoreHandle_t s_audio_mutex;
+static uint32_t s_current_sample_rate;
+static bool s_i2s_enabled;
+static volatile int s_volume_percent = 100;
+
+enum {
+  audio_volume_min_percent = 0,
+  audio_volume_max_percent = 200,
+  audio_volume_step_percent = 10,
+};
+
+static int16_t audio_abs_i16(int16_t value)
+{
+  if (value == INT16_MIN) {
+    return INT16_MAX;
+  }
+  return value < 0 ? -value : value;
+}
+
+static int16_t audio_pcm_peak(const int16_t *pcm, size_t sample_count)
+{
+  int16_t peak = 0;
+  for (size_t i = 0; i < sample_count; ++i) {
+    int16_t abs_sample = audio_abs_i16(pcm[i]);
+    if (abs_sample > peak) {
+      peak = abs_sample;
+    }
+  }
+  return peak;
+}
+
+static void audio_apply_gain(int16_t *pcm, size_t sample_count)
+{
+  int volume_percent = audio_get_volume_percent();
+  if (volume_percent == 100) {
+    return;
+  }
+
+  for (size_t i = 0; i < sample_count; ++i) {
+    int32_t sample = (int32_t)pcm[i] * volume_percent / 100;
+    if (sample > INT16_MAX) {
+      sample = INT16_MAX;
+    } else if (sample < INT16_MIN) {
+      sample = INT16_MIN;
+    }
+    pcm[i] = (int16_t)sample;
+  }
+}
+
+static void audio_log_pcm_stats(const char *prefix,
+                                size_t frame,
+                                const int16_t *pcm,
+                                size_t samples_per_channel,
+                                int channels,
+                                size_t bytes_written,
+                                size_t input_len,
+                                size_t total_http_bytes,
+                                int16_t peak_before_gain,
+                                int16_t peak_after_gain)
+{
+  size_t pcm_value_count = samples_per_channel * (channels > 1 ? 2 : 1);
+  ESP_LOGI(TAG,
+           "%s frame=%u samples/ch=%u channels=%d peak=%d volume=%d%% peak_out=%d first=[%d,%d,%d,%d] i2s=%u bytes buffered=%u downloaded=%u",
+           prefix,
+           (unsigned)frame,
+           (unsigned)samples_per_channel,
+           channels,
+           peak_before_gain,
+           audio_get_volume_percent(),
+           peak_after_gain,
+           pcm_value_count > 0 ? pcm[0] : 0,
+           pcm_value_count > 1 ? pcm[1] : 0,
+           pcm_value_count > 2 ? pcm[2] : 0,
+           pcm_value_count > 3 ? pcm[3] : 0,
+           (unsigned)bytes_written,
+           (unsigned)input_len,
+           (unsigned)total_http_bytes);
+}
+
+static esp_err_t audio_configure_i2s(uint32_t sample_rate_hz)
+{
+  if (sample_rate_hz == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (s_current_sample_rate == sample_rate_hz && s_i2s_enabled) {
+    ESP_LOGI(TAG, "I2S already configured: %lu Hz", (unsigned long)sample_rate_hz);
+    return ESP_OK;
+  }
+
+  if (s_i2s_enabled) {
+    ESP_LOGI(TAG,
+             "reconfigure I2S sample rate: %lu Hz -> %lu Hz",
+             (unsigned long)s_current_sample_rate,
+             (unsigned long)sample_rate_hz);
+    ESP_RETURN_ON_ERROR(i2s_channel_disable(s_i2s_tx_chan), TAG, "disable I2S tx failed");
+    s_i2s_enabled = false;
+  }
+
+  i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate_hz);
+  i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                                       I2S_SLOT_MODE_STEREO);
+
+  ESP_RETURN_ON_ERROR(i2s_channel_reconfig_std_clock(s_i2s_tx_chan, &clk_cfg),
+                      TAG,
+                      "reconfigure I2S clock failed");
+  ESP_RETURN_ON_ERROR(i2s_channel_reconfig_std_slot(s_i2s_tx_chan, &slot_cfg),
+                      TAG,
+                      "reconfigure I2S slot failed");
+  ESP_RETURN_ON_ERROR(i2s_channel_enable(s_i2s_tx_chan), TAG, "enable I2S tx failed");
+
+  s_current_sample_rate = sample_rate_hz;
+  s_i2s_enabled = true;
+  ESP_LOGI(TAG, "I2S configured: %lu Hz, 16-bit stereo Philips format", (unsigned long)sample_rate_hz);
+  return ESP_OK;
+}
+
+static esp_err_t audio_write_pcm(const int16_t *pcm,
+                                 size_t samples_per_channel,
+                                 int channels,
+                                 size_t *bytes_written_total)
+{
+  if (pcm == nullptr || samples_per_channel == 0 || channels <= 0) {
+    if (bytes_written_total != nullptr) {
+      *bytes_written_total = 0;
+    }
+    return ESP_OK;
+  }
+
+  size_t total_written = 0;
+  if (channels >= 2) {
+    size_t bytes_written = 0;
+    size_t expected_bytes = samples_per_channel * 2 * sizeof(int16_t);
+    esp_err_t err = i2s_channel_write(s_i2s_tx_chan,
+                                      pcm,
+                                      expected_bytes,
+                                      &bytes_written,
+                                      portMAX_DELAY);
+    if (bytes_written_total != nullptr) {
+      *bytes_written_total = bytes_written;
+    }
+    if (err == ESP_OK && bytes_written != expected_bytes) {
+      ESP_LOGW(TAG, "partial I2S stereo write: %u/%u bytes", (unsigned)bytes_written, (unsigned)expected_bytes);
+    }
+    return err;
+  }
+
+  int16_t stereo[256 * 2];
+  size_t offset = 0;
+  while (offset < samples_per_channel) {
+    size_t chunk = samples_per_channel - offset;
+    if (chunk > 256) {
+      chunk = 256;
+    }
+
+    for (size_t i = 0; i < chunk; ++i) {
+      stereo[i * 2] = pcm[offset + i];
+      stereo[i * 2 + 1] = pcm[offset + i];
+    }
+
+    size_t bytes_written = 0;
+    size_t expected_bytes = chunk * 2 * sizeof(int16_t);
+    ESP_RETURN_ON_ERROR(i2s_channel_write(s_i2s_tx_chan,
+                                          stereo,
+                                          expected_bytes,
+                                          &bytes_written,
+                                          portMAX_DELAY),
+                        TAG,
+                        "write mono PCM failed");
+    if (bytes_written != expected_bytes) {
+      ESP_LOGW(TAG, "partial I2S mono write: %u/%u bytes", (unsigned)bytes_written, (unsigned)expected_bytes);
+    }
+    total_written += bytes_written;
+    offset += chunk;
+  }
+
+  if (bytes_written_total != nullptr) {
+    *bytes_written_total = total_written;
+  }
+  return ESP_OK;
+}
+
+extern "C" esp_err_t audio_init(void)
+{
+  if (s_i2s_tx_chan != nullptr) {
+    return ESP_OK;
+  }
+
+  s_audio_mutex = xSemaphoreCreateMutex();
+  ESP_RETURN_ON_FALSE(s_audio_mutex != nullptr, ESP_ERR_NO_MEM, TAG, "create audio mutex failed");
+
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_i2s_tx_chan, nullptr),
+                      TAG,
+                      "create I2S tx channel failed");
+
+  i2s_std_config_t std_cfg = {
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_I2S_SAMPLE_RATE_HZ),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                    I2S_SLOT_MODE_STEREO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = AUDIO_I2S_PIN_BCLK,
+      .ws = AUDIO_I2S_PIN_LRCLK,
+      .dout = AUDIO_I2S_PIN_DIN,
+      .din = I2S_GPIO_UNUSED,
+      .invert_flags = {
+        .mclk_inv = false,
+        .bclk_inv = false,
+        .ws_inv = false,
+      },
+    },
+  };
+
+  ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_i2s_tx_chan, &std_cfg),
+                      TAG,
+                      "init I2S std mode failed");
+  ESP_RETURN_ON_ERROR(i2s_channel_enable(s_i2s_tx_chan), TAG, "enable I2S tx failed");
+
+  s_current_sample_rate = AUDIO_I2S_SAMPLE_RATE_HZ;
+  s_i2s_enabled = true;
+
+  ESP_LOGI(TAG,
+           "MAX98357A I2S ready: BCLK=%d LRCLK=%d DIN=%d",
+           AUDIO_I2S_PIN_BCLK,
+           AUDIO_I2S_PIN_LRCLK,
+           AUDIO_I2S_PIN_DIN);
+  return ESP_OK;
+}
+
+static int audio_clamp_volume_percent(int volume_percent)
+{
+  if (volume_percent < audio_volume_min_percent) {
+    return audio_volume_min_percent;
+  }
+  if (volume_percent > audio_volume_max_percent) {
+    return audio_volume_max_percent;
+  }
+  return volume_percent;
+}
+
+extern "C" int audio_get_volume_percent(void)
+{
+  return s_volume_percent;
+}
+
+extern "C" int audio_volume_up(void)
+{
+  s_volume_percent = audio_clamp_volume_percent(s_volume_percent + audio_volume_step_percent);
+  ESP_LOGI(TAG, "volume up: %d%%", s_volume_percent);
+  return s_volume_percent;
+}
+
+extern "C" int audio_volume_down(void)
+{
+  s_volume_percent = audio_clamp_volume_percent(s_volume_percent - audio_volume_step_percent);
+  ESP_LOGI(TAG, "volume down: %d%%", s_volume_percent);
+  return s_volume_percent;
+}
+
+extern "C" esp_err_t audio_play_test_tone(void)
+{
+  ESP_RETURN_ON_ERROR(audio_init(), TAG, "audio init failed");
+
+  enum {
+    tone_hz = 880,
+    duration_ms = 180,
+    amplitude = 1200,
+    frames_per_chunk = 128,
+  };
+
+  ESP_RETURN_ON_ERROR(audio_configure_i2s(AUDIO_I2S_SAMPLE_RATE_HZ), TAG, "configure test tone failed");
+  ESP_LOGI(TAG,
+           "play test tone: %d Hz, %d ms, amplitude=%d",
+           tone_hz,
+           duration_ms,
+           amplitude);
+
+  int16_t samples[frames_per_chunk * 2];
+  const int total_frames = AUDIO_I2S_SAMPLE_RATE_HZ * duration_ms / 1000;
+  int written_frames = 0;
+
+  while (written_frames < total_frames) {
+    int chunk_frames = total_frames - written_frames;
+    if (chunk_frames > frames_per_chunk) {
+      chunk_frames = frames_per_chunk;
+    }
+
+    for (int i = 0; i < chunk_frames; ++i) {
+      float phase = 2.0f * (float)M_PI * (float)tone_hz *
+                    (float)(written_frames + i) / (float)AUDIO_I2S_SAMPLE_RATE_HZ;
+      int16_t sample = (int16_t)((float)amplitude * sinf(phase));
+      samples[i * 2] = sample;
+      samples[i * 2 + 1] = sample;
+    }
+    audio_apply_gain(samples, chunk_frames * 2);
+
+    size_t bytes_written = 0;
+    ESP_RETURN_ON_ERROR(audio_write_pcm(samples, chunk_frames, 2, &bytes_written),
+                        TAG,
+                        "write test tone failed");
+    written_frames += chunk_frames;
+  }
+
+  return ESP_OK;
+}
+
+extern "C" esp_err_t audio_play_mp3_url(const char *url)
+{
+  ESP_RETURN_ON_ERROR(audio_init(), TAG, "audio init failed");
+  ESP_RETURN_ON_FALSE(url != nullptr && url[0] != '\0', ESP_ERR_INVALID_ARG, TAG, "empty URL");
+
+  if (xSemaphoreTake(s_audio_mutex, 0) != pdTRUE) {
+    ESP_LOGW(TAG, "audio playback is already running");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  esp_err_t ret = ESP_OK;
+  esp_http_client_handle_t client = nullptr;
+  uint8_t *input_buf = nullptr;
+  int16_t *pcm_buf = nullptr;
+  micro_mp3::Mp3Decoder decoder;
+  size_t input_len = 0;
+  bool stream_finished = false;
+  bool stream_configured = false;
+  size_t total_http_bytes = 0;
+  size_t decoded_frames = 0;
+  size_t total_pcm_frames = 0;
+  size_t total_i2s_bytes = 0;
+  size_t need_more_count = 0;
+  size_t decode_error_count = 0;
+  size_t zero_peak_frames = 0;
+  int16_t max_peak = 0;
+  int64_t content_length = 0;
+
+  esp_http_client_config_t http_cfg = {};
+  http_cfg.url = url;
+  http_cfg.timeout_ms = 8000;
+  http_cfg.buffer_size = 4096;
+
+  ESP_LOGI(TAG, "start MP3 playback: %s", url);
+  client = esp_http_client_init(&http_cfg);
+  ESP_GOTO_ON_FALSE(client != nullptr, ESP_ERR_NO_MEM, cleanup, TAG, "create HTTP client failed");
+  ESP_GOTO_ON_ERROR(esp_http_client_open(client, 0), cleanup, TAG, "open MP3 URL failed");
+  content_length = esp_http_client_fetch_headers(client);
+  ESP_LOGI(TAG,
+           "HTTP status=%d content_length=%lld",
+           esp_http_client_get_status_code(client),
+           (long long)content_length);
+
+  input_buf = (uint8_t *)malloc(AUDIO_MP3_INPUT_BUFFER_BYTES);
+  pcm_buf = (int16_t *)malloc(micro_mp3::MP3_MIN_OUTPUT_BUFFER_BYTES);
+  ESP_GOTO_ON_FALSE(input_buf != nullptr && pcm_buf != nullptr,
+                    ESP_ERR_NO_MEM,
+                    cleanup,
+                    TAG,
+                    "allocate MP3 buffers failed");
+
+  while (!stream_finished || input_len > 0) {
+    if (!stream_finished && input_len < AUDIO_MP3_INPUT_BUFFER_BYTES / 2) {
+      int read_len = esp_http_client_read(client,
+                                         (char *)input_buf + input_len,
+                                         AUDIO_MP3_INPUT_BUFFER_BYTES - input_len);
+      if (read_len < 0) {
+        ret = ESP_FAIL;
+        ESP_LOGE(TAG, "read MP3 stream failed");
+        break;
+      }
+      if (read_len == 0) {
+        stream_finished = true;
+        ESP_LOGI(TAG,
+                 "HTTP stream ended: downloaded=%u bytes buffered=%u bytes",
+                 (unsigned)total_http_bytes,
+                 (unsigned)input_len);
+      } else {
+        input_len += (size_t)read_len;
+        total_http_bytes += (size_t)read_len;
+      }
+    }
+
+    if (input_len == 0) {
+      continue;
+    }
+
+    size_t consumed = 0;
+    size_t samples = 0;
+    micro_mp3::Mp3Result result = decoder.decode(input_buf,
+                                                 input_len,
+                                                 (uint8_t *)pcm_buf,
+                                                 micro_mp3::MP3_MIN_OUTPUT_BUFFER_BYTES,
+                                                 consumed,
+                                                 samples);
+    if (consumed > 0) {
+      memmove(input_buf, input_buf + consumed, input_len - consumed);
+      input_len -= consumed;
+    }
+
+    if (result == micro_mp3::MP3_STREAM_INFO_READY && !stream_configured) {
+      ESP_LOGI(TAG,
+               "MP3 stream: %d Hz, %d channel(s), %d kbps",
+               decoder.get_sample_rate(),
+               decoder.get_channels(),
+               decoder.get_bitrate());
+      ret = audio_configure_i2s((uint32_t)decoder.get_sample_rate());
+      if (ret != ESP_OK) {
+        break;
+      }
+      stream_configured = true;
+      continue;
+    }
+
+    if (result == micro_mp3::MP3_NEED_MORE_DATA) {
+      ++need_more_count;
+      if (stream_finished) {
+        ESP_LOGW(TAG,
+                 "decoder needs more data after HTTP EOF: buffered=%u consumed=%u",
+                 (unsigned)input_len,
+                 (unsigned)consumed);
+        break;
+      }
+      continue;
+    }
+
+    if (result == micro_mp3::MP3_DECODE_ERROR) {
+      ++decode_error_count;
+      ESP_LOGW(TAG, "skip corrupt MP3 frame");
+      continue;
+    }
+
+    if (result < 0) {
+      ret = ESP_FAIL;
+      ESP_LOGE(TAG, "MP3 decode failed: %d", (int)result);
+      break;
+    }
+
+    if (samples > 0) {
+      ++decoded_frames;
+      total_pcm_frames += samples;
+      int channels = decoder.get_channels();
+      size_t pcm_value_count = samples * (channels > 1 ? 2 : 1);
+      int16_t peak = audio_pcm_peak(pcm_buf, pcm_value_count);
+      if (peak == 0) {
+        ++zero_peak_frames;
+      }
+      if (peak > max_peak) {
+        max_peak = peak;
+      }
+      audio_apply_gain(pcm_buf, pcm_value_count);
+      int16_t output_peak = audio_pcm_peak(pcm_buf, pcm_value_count);
+
+      if (!stream_configured) {
+        ret = audio_configure_i2s((uint32_t)decoder.get_sample_rate());
+        if (ret != ESP_OK) {
+          break;
+        }
+        stream_configured = true;
+      }
+
+      size_t bytes_written = 0;
+      ret = audio_write_pcm(pcm_buf, samples, channels, &bytes_written);
+      if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "write decoded PCM failed");
+        break;
+      }
+      total_i2s_bytes += bytes_written;
+
+      if (decoded_frames <= 5 || decoded_frames % 50 == 0) {
+        audio_log_pcm_stats("pcm",
+                            decoded_frames,
+                            pcm_buf,
+                            samples,
+                            channels,
+                            bytes_written,
+                            input_len,
+                            total_http_bytes,
+                            peak,
+                            output_peak);
+      }
+    }
+  }
+
+cleanup:
+  if (client != nullptr) {
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+  }
+  free(input_buf);
+  free(pcm_buf);
+  ESP_LOGI(TAG,
+           "MP3 playback finished: ret=%s downloaded=%u decoded_frames=%u pcm_frames/ch=%u i2s_bytes=%u need_more=%u decode_errors=%u zero_peak_frames=%u max_peak=%d",
+           esp_err_to_name(ret),
+           (unsigned)total_http_bytes,
+           (unsigned)decoded_frames,
+           (unsigned)total_pcm_frames,
+           (unsigned)total_i2s_bytes,
+           (unsigned)need_more_count,
+           (unsigned)decode_error_count,
+           (unsigned)zero_peak_frames,
+           max_peak);
+  xSemaphoreGive(s_audio_mutex);
+  return ret;
+}

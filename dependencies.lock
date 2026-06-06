@@ -13,6 +13,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.0.6
+  esphome/micro-mp3:
+    component_hash: b6637ace7c12f72b989634d02359fd6f6cb072ce8a9bd66f1a602dc4cd1e95ba
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.1
   espressif/cmake_utilities:
     component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
@@ -60,8 +70,9 @@ dependencies:
     version: 8.3.11
 direct_dependencies:
 - atanisoft/esp_lcd_touch_xpt2046
+- esphome/micro-mp3
 - espressif/esp_lcd_ili9341
 - lvgl/lvgl
-manifest_hash: a56e1b7f8540d3462abf04bd7fd9cf10347815b87349f06039ebb5f8b0c1fc40
+manifest_hash: f93a4b3c16ab2abe504b4614257511359b50a1307534fc68fd2c7399269acbba
 target: esp32s3
 version: 2.0.0

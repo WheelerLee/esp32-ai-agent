@@ -2,7 +2,11 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
+#include "app_wifi.h"
+#include "audio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -27,11 +31,109 @@ static esp_lcd_panel_handle_t s_panel_handle;
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t s_disp_drv;
 static lv_indev_drv_t s_indev_drv;
-static lv_obj_t *s_text_label;
-static lv_obj_t *s_button;
+static lv_obj_t *s_wifi_status_label;
+static lv_obj_t *s_wifi_list;
+static lv_obj_t *s_password_ta;
+static lv_obj_t *s_keyboard;
 static esp_lcd_touch_handle_t s_touch_handle;
 static SemaphoreHandle_t s_lvgl_mutex;
 static TaskHandle_t s_lvgl_task_handle;
+static app_wifi_ap_record_t s_scan_results[APP_WIFI_MAX_APS];
+static size_t s_scan_count;
+static char s_selected_ssid[APP_WIFI_SSID_MAX_LEN + 1];
+
+static void show_home_page(void);
+static void show_wifi_page(void);
+static void show_wifi_connect_page(const char *ssid);
+static void start_wifi_scan(void);
+static void update_wifi_status_text(void);
+
+#define LCD_PLAY_URL "http://192.168.1.112:5500/music.mp3"
+
+static uint16_t clamp_u16(uint16_t value, uint16_t min_value, uint16_t max_value)
+{
+  if (value < min_value) {
+    return min_value;
+  }
+  if (value > max_value) {
+    return max_value;
+  }
+  return value;
+}
+
+static uint16_t map_touch_axis(uint16_t value,
+                               uint16_t in_min,
+                               uint16_t in_max,
+                               uint16_t out_max)
+{
+  value = clamp_u16(value, in_min, in_max);
+  return (uint32_t)(value - in_min) * out_max / (in_max - in_min);
+}
+
+static void touch_process_coordinates(esp_lcd_touch_handle_t tp,
+                                      uint16_t *x,
+                                      uint16_t *y,
+                                      uint16_t *strength,
+                                      uint8_t *point_num,
+                                      uint8_t max_point_num)
+{
+  (void)tp;
+  (void)strength;
+
+  if (x == NULL || y == NULL || point_num == NULL) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < *point_num && i < max_point_num; ++i) {
+    uint16_t raw_x = x[i];
+    uint16_t raw_y = y[i];
+    uint16_t mapped_x;
+    uint16_t mapped_y;
+
+    if (LCD_TOUCH_SWAP_XY) {
+      mapped_x = map_touch_axis(raw_y, LCD_TOUCH_RAW_Y_MIN, LCD_TOUCH_RAW_Y_MAX, LCD_H_RES - 1);
+      mapped_y = map_touch_axis(raw_x, LCD_TOUCH_RAW_X_MIN, LCD_TOUCH_RAW_X_MAX, LCD_V_RES - 1);
+    } else {
+      mapped_x = map_touch_axis(raw_x, LCD_TOUCH_RAW_X_MIN, LCD_TOUCH_RAW_X_MAX, LCD_H_RES - 1);
+      mapped_y = map_touch_axis(raw_y, LCD_TOUCH_RAW_Y_MIN, LCD_TOUCH_RAW_Y_MAX, LCD_V_RES - 1);
+    }
+
+    if (LCD_TOUCH_MIRROR_X) {
+      mapped_x = (LCD_H_RES - 1) - mapped_x;
+    }
+    if (LCD_TOUCH_MIRROR_Y) {
+      mapped_y = (LCD_V_RES - 1) - mapped_y;
+    }
+
+    x[i] = mapped_x;
+    y[i] = mapped_y;
+
+    static int64_t s_last_log_us;
+    int64_t now_us = esp_timer_get_time();
+    if (now_us - s_last_log_us > 500000) {
+      ESP_LOGI(TAG, "touch raw=(%u,%u) mapped=(%u,%u)", raw_x, raw_y, mapped_x, mapped_y);
+      s_last_log_us = now_us;
+    }
+  }
+}
+
+static void async_show_home_page(void *arg)
+{
+  (void)arg;
+  show_home_page();
+}
+
+static void async_show_wifi_page(void *arg)
+{
+  (void)arg;
+  show_wifi_page();
+}
+
+static void async_show_wifi_connect_page(void *arg)
+{
+  (void)arg;
+  show_wifi_connect_page(s_selected_ssid);
+}
 
 // LVGL is not thread-safe, so all LVGL object/timer calls share this mutex.
 static void lvgl_lock(void)
@@ -81,10 +183,507 @@ static void lvgl_tick_cb(void *arg)
   lv_tick_inc(2);
 }
 
-static void button_event_cb(lv_event_t *event)
+static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_t *font)
+{
+  lv_obj_t *label = lv_label_create(parent);
+  if (label != NULL) {
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(0x1f2937), 0);
+    lv_label_set_text(label, text != NULL ? text : "");
+  }
+  return label;
+}
+
+static lv_obj_t *create_button(lv_obj_t *parent,
+                               const char *text,
+                               lv_coord_t width,
+                               lv_coord_t height,
+                               lv_event_cb_t cb,
+                               void *user_data)
+{
+  lv_obj_t *button = lv_btn_create(parent);
+  if (button == NULL) {
+    return NULL;
+  }
+
+  lv_obj_set_size(button, width, height);
+  lv_obj_set_style_radius(button, 6, 0);
+  lv_obj_set_style_bg_color(button, lv_color_hex(0x2563eb), 0);
+  lv_obj_set_style_bg_color(button, lv_color_hex(0x1d4ed8), LV_STATE_PRESSED);
+  if (cb != NULL) {
+    lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, user_data);
+  }
+
+  lv_obj_t *label = create_label(button, text, &lv_font_chinese_16);
+  if (label != NULL) {
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+  }
+
+  return button;
+}
+
+static lv_obj_t *create_list_row(lv_obj_t *parent,
+                                 const char *text,
+                                 lv_coord_t width,
+                                 lv_coord_t height,
+                                 lv_event_cb_t cb,
+                                 void *user_data)
+{
+  lv_obj_t *row = lv_obj_create(parent);
+  if (row == NULL) {
+    return NULL;
+  }
+
+  lv_obj_set_size(row, width, height);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE | LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+  lv_obj_set_style_radius(row, 6, 0);
+  lv_obj_set_style_border_width(row, 1, 0);
+  lv_obj_set_style_border_color(row, lv_color_hex(0xcbd5e1), 0);
+  lv_obj_set_style_bg_color(row, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_bg_color(row, lv_color_hex(0xe0f2fe), LV_STATE_PRESSED);
+  lv_obj_set_style_pad_left(row, 8, 0);
+  lv_obj_set_style_pad_right(row, 8, 0);
+  if (cb != NULL) {
+    lv_obj_add_event_cb(row, cb, LV_EVENT_CLICKED, user_data);
+  }
+
+  lv_obj_t *label = create_label(row, text, &lv_font_chinese_16);
+  if (label != NULL) {
+    lv_obj_set_width(label, width - 16);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+  }
+
+  return row;
+}
+
+static void clear_screen(void)
+{
+  lv_obj_clean(lv_scr_act());
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0xf8fafc), 0);
+  lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+}
+
+static void home_wifi_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
-    ESP_LOGI(TAG, "LVGL button clicked");
+    lv_async_call(async_show_wifi_page, NULL);
+  }
+}
+
+static void play_task(void *arg)
+{
+  const char *url = (const char *)arg;
+  esp_err_t err = audio_play_test_tone();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "play I2S test tone failed: %s", esp_err_to_name(err));
+  }
+  vTaskDelay(pdMS_TO_TICKS(250));
+
+  err = audio_play_mp3_url(url);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "play %s failed: %s", url, esp_err_to_name(err));
+  }
+  vTaskDelete(NULL);
+}
+
+static void home_play_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  BaseType_t ret = xTaskCreate(play_task, "audio_play", 8192, (void *)LCD_PLAY_URL, 5, NULL);
+  if (ret != pdPASS) {
+    ESP_LOGE(TAG, "create audio play task failed");
+  }
+}
+
+static void home_volume_down_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+    audio_volume_down();
+  }
+}
+
+static void home_volume_up_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+    audio_volume_up();
+  }
+}
+
+static void wifi_back_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+    lv_async_call(async_show_home_page, NULL);
+  }
+}
+
+static void wifi_refresh_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+    lv_async_call(async_show_wifi_page, NULL);
+  }
+}
+
+static void connect_back_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+    lv_async_call(async_show_wifi_page, NULL);
+  }
+}
+
+static void wifi_scan_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+    start_wifi_scan();
+  }
+}
+
+static void close_keyboard(void)
+{
+  if (s_keyboard != NULL) {
+    lv_obj_del(s_keyboard);
+    s_keyboard = NULL;
+  }
+}
+
+static void textarea_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) != LV_EVENT_FOCUSED || s_password_ta == NULL) {
+    return;
+  }
+
+  close_keyboard();
+  s_keyboard = lv_keyboard_create(lv_scr_act());
+  if (s_keyboard != NULL) {
+    lv_obj_set_size(s_keyboard, LCD_H_RES, 96);
+    lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(s_keyboard, s_password_ta);
+  }
+}
+
+static void connect_task(void *arg)
+{
+  char password[65] = {0};
+  if (arg != NULL) {
+    strlcpy(password, (const char *)arg, sizeof(password));
+  }
+
+  esp_err_t err = app_wifi_connect(s_selected_ssid, password);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "connect to %s failed: %s", s_selected_ssid, esp_err_to_name(err));
+  }
+
+  for (int i = 0; i < 20; ++i) {
+    lvgl_lock();
+    update_wifi_status_text();
+    lvgl_unlock();
+
+    app_wifi_status_t status = {0};
+    app_wifi_get_status(&status);
+    if (status.connected || (!status.connecting && i > 1)) {
+      break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+
+  lvgl_lock();
+  show_wifi_page();
+  lvgl_unlock();
+  vTaskDelete(NULL);
+}
+
+static void connect_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED || s_password_ta == NULL) {
+    return;
+  }
+
+  const char *password = lv_textarea_get_text(s_password_ta);
+  static char s_password[65];
+  strlcpy(s_password, password != NULL ? password : "", sizeof(s_password));
+  close_keyboard();
+  update_wifi_status_text();
+
+  BaseType_t ret = xTaskCreate(connect_task, "wifi_connect", 4096, s_password, 4, NULL);
+  if (ret != pdPASS) {
+    ESP_LOGE(TAG, "create WiFi connect task failed");
+  }
+}
+
+static void ssid_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+    return;
+  }
+
+  const char *ssid = (const char *)lv_event_get_user_data(event);
+  if (ssid == NULL || ssid[0] == '\0') {
+    return;
+  }
+
+  strlcpy(s_selected_ssid, ssid, sizeof(s_selected_ssid));
+  lv_async_call(async_show_wifi_connect_page, NULL);
+}
+
+static void update_wifi_status_text(void)
+{
+  if (s_wifi_status_label == NULL) {
+    return;
+  }
+
+  app_wifi_status_t status = {0};
+  app_wifi_get_status(&status);
+
+  char text[160];
+  if (status.connected) {
+    snprintf(text,
+             sizeof(text),
+             "Connected\nSSID: %s\nIP: " IPSTR "\nGW: " IPSTR,
+             status.ssid,
+             IP2STR(&status.ip_info.ip),
+             IP2STR(&status.ip_info.gw));
+  } else if (status.connecting) {
+    snprintf(text, sizeof(text), "Connecting\nSSID: %s", status.ssid);
+  } else {
+    snprintf(text, sizeof(text), "Not connected\nScan WiFi networks below");
+  }
+
+  lv_label_set_text(s_wifi_status_label, text);
+}
+
+static void show_scan_results_locked(void)
+{
+  if (s_wifi_list == NULL) {
+    return;
+  }
+
+  lv_obj_clean(s_wifi_list);
+  if (s_scan_count == 0) {
+    create_label(s_wifi_list, "No WiFi found", &lv_font_chinese_16);
+    return;
+  }
+
+  for (size_t i = 0; i < s_scan_count; ++i) {
+    char row_text[64];
+    snprintf(row_text,
+             sizeof(row_text),
+             "%s  %d dBm",
+             s_scan_results[i].ssid[0] != '\0' ? s_scan_results[i].ssid : "<hidden>",
+             s_scan_results[i].rssi);
+    lv_obj_t *row = create_list_row(s_wifi_list,
+                                    row_text,
+                                    LCD_H_RES - 32,
+                                    34,
+                                    ssid_event_cb,
+                                    s_scan_results[i].ssid);
+    if (row != NULL) {
+      lv_obj_set_scroll_dir(row, LV_DIR_VER);
+    }
+  }
+}
+
+static void scan_task(void *arg)
+{
+  (void)arg;
+
+  size_t count = 0;
+  esp_err_t err = app_wifi_scan(s_scan_results, APP_WIFI_MAX_APS, &count);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "scan WiFi failed: %s", esp_err_to_name(err));
+    count = 0;
+  }
+
+  lvgl_lock();
+  s_scan_count = count;
+  update_wifi_status_text();
+  show_scan_results_locked();
+  lvgl_unlock();
+
+  vTaskDelete(NULL);
+}
+
+static void start_wifi_scan(void)
+{
+  close_keyboard();
+  s_password_ta = NULL;
+  s_scan_count = 0;
+
+  if (s_wifi_list != NULL) {
+    lv_obj_clean(s_wifi_list);
+    create_label(s_wifi_list, "Scanning...", &lv_font_chinese_16);
+  }
+
+  BaseType_t ret = xTaskCreate(scan_task, "wifi_scan", 4096, NULL, 4, NULL);
+  if (ret != pdPASS) {
+    ESP_LOGE(TAG, "create WiFi scan task failed");
+  }
+}
+
+static void show_home_page(void)
+{
+  close_keyboard();
+  s_wifi_status_label = NULL;
+  s_wifi_list = NULL;
+  s_password_ta = NULL;
+
+  clear_screen();
+
+  lv_obj_t *title = create_label(lv_scr_act(), "esp32 demo", &lv_font_chinese_16);
+  if (title != NULL) {
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 36);
+  }
+
+  lv_obj_t *wifi_button = create_button(lv_scr_act(), "WiFi", 180, 58, home_wifi_event_cb, NULL);
+  if (wifi_button != NULL) {
+    lv_obj_align(wifi_button, LV_ALIGN_CENTER, 0, -18);
+  }
+
+  lv_obj_t *volume_down_button = create_button(lv_scr_act(), "Vol-", 58, 58, home_volume_down_event_cb, NULL);
+  if (volume_down_button != NULL) {
+    lv_obj_align(volume_down_button, LV_ALIGN_CENTER, -96, 52);
+  }
+
+  lv_obj_t *play_button = create_button(lv_scr_act(), "Play", 104, 58, home_play_event_cb, NULL);
+  if (play_button != NULL) {
+    lv_obj_align(play_button, LV_ALIGN_CENTER, 0, 52);
+  }
+
+  lv_obj_t *volume_up_button = create_button(lv_scr_act(), "Vol+", 58, 58, home_volume_up_event_cb, NULL);
+  if (volume_up_button != NULL) {
+    lv_obj_align(volume_up_button, LV_ALIGN_CENTER, 96, 52);
+  }
+}
+
+static void show_wifi_connect_page(const char *ssid)
+{
+  close_keyboard();
+  s_wifi_status_label = NULL;
+  s_wifi_list = NULL;
+  s_password_ta = NULL;
+
+  clear_screen();
+
+  lv_obj_t *header = lv_obj_create(lv_scr_act());
+  if (header != NULL) {
+    lv_obj_set_size(header, LCD_H_RES, 42);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_radius(header, 0, 0);
+    lv_obj_set_style_bg_color(header, lv_color_hex(0xe2e8f0), 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back = create_button(header, "Back", 72, 30, connect_back_event_cb, NULL);
+    if (back != NULL) {
+      lv_obj_align(back, LV_ALIGN_LEFT_MID, 4, 0);
+    }
+
+    lv_obj_t *title = create_label(header, "Connect", &lv_font_chinese_16);
+    if (title != NULL) {
+      lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+    }
+  }
+
+  char ssid_text[64];
+  snprintf(ssid_text, sizeof(ssid_text), "SSID: %s", ssid != NULL ? ssid : "");
+  lv_obj_t *ssid_label = create_label(lv_scr_act(), ssid_text, &lv_font_chinese_16);
+  if (ssid_label != NULL) {
+    lv_obj_set_width(ssid_label, LCD_H_RES - 24);
+    lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(ssid_label, LV_ALIGN_TOP_LEFT, 12, 52);
+  }
+
+  s_password_ta = lv_textarea_create(lv_scr_act());
+  if (s_password_ta != NULL) {
+    lv_obj_set_size(s_password_ta, LCD_H_RES - 24, 38);
+    lv_obj_align(s_password_ta, LV_ALIGN_TOP_MID, 0, 78);
+    lv_textarea_set_one_line(s_password_ta, true);
+    lv_textarea_set_password_mode(s_password_ta, false);
+    lv_textarea_set_placeholder_text(s_password_ta, "Password");
+    lv_obj_add_event_cb(s_password_ta, textarea_event_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_state(s_password_ta, LV_STATE_FOCUSED);
+  }
+
+  lv_obj_t *connect = create_button(lv_scr_act(), "Connect", LCD_H_RES - 24, 34, connect_event_cb, NULL);
+  if (connect != NULL) {
+    lv_obj_align(connect, LV_ALIGN_TOP_MID, 0, 122);
+  }
+
+  if (s_password_ta != NULL) {
+    s_keyboard = lv_keyboard_create(lv_scr_act());
+    if (s_keyboard != NULL) {
+      lv_obj_set_size(s_keyboard, LCD_H_RES, 78);
+      lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+      lv_keyboard_set_textarea(s_keyboard, s_password_ta);
+    }
+  }
+}
+
+static void show_wifi_page(void)
+{
+  close_keyboard();
+  s_password_ta = NULL;
+  clear_screen();
+
+  lv_obj_t *header = lv_obj_create(lv_scr_act());
+  if (header != NULL) {
+    lv_obj_set_size(header, LCD_H_RES, 42);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_radius(header, 0, 0);
+    lv_obj_set_style_bg_color(header, lv_color_hex(0xe2e8f0), 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back = create_button(header, "Back", 72, 30, wifi_back_event_cb, NULL);
+    if (back != NULL) {
+      lv_obj_align(back, LV_ALIGN_LEFT_MID, 4, 0);
+    }
+
+    lv_obj_t *title = create_label(header, "WiFi", &lv_font_chinese_16);
+    if (title != NULL) {
+      lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+    }
+
+    lv_obj_t *refresh = create_button(header, "Refresh", 86, 30, wifi_refresh_event_cb, NULL);
+    if (refresh != NULL) {
+      lv_obj_align(refresh, LV_ALIGN_RIGHT_MID, -4, 0);
+    }
+  }
+
+  s_wifi_status_label = create_label(lv_scr_act(), "", &lv_font_chinese_16);
+  if (s_wifi_status_label != NULL) {
+    lv_obj_set_width(s_wifi_status_label, LCD_H_RES - 24);
+    lv_label_set_long_mode(s_wifi_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_wifi_status_label, LV_ALIGN_TOP_LEFT, 12, 52);
+  }
+  update_wifi_status_text();
+
+  s_wifi_list = lv_obj_create(lv_scr_act());
+  if (s_wifi_list != NULL) {
+    lv_obj_set_size(s_wifi_list, LCD_H_RES - 16, 108);
+    lv_obj_align(s_wifi_list, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_flex_flow(s_wifi_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(s_wifi_list, 6, 0);
+    lv_obj_set_style_pad_row(s_wifi_list, 6, 0);
+    lv_obj_set_style_radius(s_wifi_list, 6, 0);
+    lv_obj_set_style_bg_color(s_wifi_list, lv_color_white(), 0);
+    lv_obj_set_style_border_color(s_wifi_list, lv_color_hex(0xcbd5e1), 0);
+    lv_obj_set_scroll_dir(s_wifi_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_wifi_list, LV_SCROLLBAR_MODE_AUTO);
+  }
+
+  app_wifi_status_t status = {0};
+  app_wifi_get_status(&status);
+  if (status.connected || status.connecting) {
+    if (s_wifi_list != NULL) {
+      create_button(s_wifi_list, "Scan Again", LCD_H_RES - 32, 36, wifi_scan_event_cb, NULL);
+    }
+  } else {
+    start_wifi_scan();
   }
 }
 
@@ -223,10 +822,11 @@ static esp_err_t touch_init(void)
     .rst_gpio_num = GPIO_NUM_NC,
     .int_gpio_num = LCD_PIN_NUM_TOUCH_IRQ,
     .flags = {
-      .swap_xy = LCD_SWAP_XY,
-      .mirror_x = LCD_MIRROR_X,
-      .mirror_y = LCD_MIRROR_Y,
+      .swap_xy = false,
+      .mirror_x = false,
+      .mirror_y = false,
     },
+    .process_coordinates = touch_process_coordinates,
   };
 
   ESP_LOGI(TAG, "initialize XPT2046 touch controller");
@@ -293,26 +893,10 @@ esp_err_t lcd_init(void)
   ESP_RETURN_ON_ERROR(lcd_backlight_init(), TAG, "backlight init failed");
   ESP_RETURN_ON_ERROR(lcd_panel_init(), TAG, "panel init failed");
   ESP_RETURN_ON_ERROR(lvgl_port_init(), TAG, "LVGL init failed");
+  ESP_RETURN_ON_ERROR(app_wifi_init(), TAG, "WiFi init failed");
 
   lvgl_lock();
-  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_white(), 0);
-  lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
-  s_text_label = lv_label_create(lv_scr_act());
-  if (s_text_label == NULL) {
-    ESP_LOGE(TAG, "create text label failed");
-    lvgl_unlock();
-    return ESP_ERR_NO_MEM;
-  }
-  lv_obj_set_style_bg_opa(s_text_label, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_text_font(s_text_label, &lv_font_chinese_16, 0);
-  lv_obj_set_style_text_color(s_text_label, lv_color_black(), 0);
-  lv_obj_set_style_text_opa(s_text_label, LV_OPA_COVER, 0);
-  lv_label_set_long_mode(s_text_label, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(s_text_label, LCD_H_RES - 20);
-  lv_obj_set_style_text_align(s_text_label, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(s_text_label, "");
-  lv_obj_align(s_text_label, LV_ALIGN_CENTER, 0, 0);
-
+  show_home_page();
   lv_obj_invalidate(lv_scr_act());
   lvgl_unlock();
 
@@ -321,31 +905,9 @@ esp_err_t lcd_init(void)
 
 void lcd_show_text(const char *text)
 {
-  lvgl_lock();
-  if (s_text_label != NULL) {
-    lv_label_set_text(s_text_label, text != NULL ? text : "");
-    lv_obj_align(s_text_label, LV_ALIGN_CENTER, 0, -24);
-  }
-  if (s_button == NULL) {
-    s_button = lv_btn_create(lv_scr_act());
-    if (s_button != NULL) {
-      lv_obj_set_size(s_button, 120, 42);
-      lv_obj_add_event_cb(s_button, button_event_cb, LV_EVENT_CLICKED, NULL);
+  (void)text;
 
-      lv_obj_t *button_label = lv_label_create(s_button);
-      if (button_label != NULL) {
-        lv_obj_set_style_text_font(button_label, &lv_font_chinese_16, 0);
-        lv_label_set_text(button_label, "Click Me");
-        lv_obj_center(button_label);
-      }
-    } else {
-      ESP_LOGE(TAG, "create button failed");
-    }
-  }
-  if (s_button != NULL && s_text_label != NULL) {
-    lv_obj_align_to(s_button, s_text_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 14);
-  }
-  lv_obj_invalidate(lv_scr_act());
-  lv_timer_handler();
+  lvgl_lock();
+  show_home_page();
   lvgl_unlock();
 }

@@ -17,6 +17,16 @@
 #define LCD_MIRROR_X false
 #define LCD_MIRROR_Y false
 
+// XPT2046 modules report raw 12-bit ADC coordinates. Keep calibration and
+// orientation independent from the LCD panel rotation.
+#define LCD_TOUCH_RAW_X_MIN 200
+#define LCD_TOUCH_RAW_X_MAX 3900
+#define LCD_TOUCH_RAW_Y_MIN 200
+#define LCD_TOUCH_RAW_Y_MAX 3900
+#define LCD_TOUCH_SWAP_XY true
+#define LCD_TOUCH_MIRROR_X true
+#define LCD_TOUCH_MIRROR_Y true
+
 // ESP32-S3 SPI2/FSPI native IO_MUX pins.
 #define LCD_PIN_NUM_SCLK GPIO_NUM_12
 #define LCD_PIN_NUM_MOSI GPIO_NUM_11

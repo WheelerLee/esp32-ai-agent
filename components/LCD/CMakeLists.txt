@@ -6,13 +6,15 @@ set(include_dirs
             include)
 
 set(requires
+            AUDIO
             driver
             esp_lcd
             esp_lcd_ili9341
             esp_lcd_touch
             esp_lcd_touch_xpt2046
             esp_timer
-            lvgl)
+            lvgl
+            WIFI)
 
 idf_component_register(SRCS ${srcs}
                       INCLUDE_DIRS ${include_dirs}
