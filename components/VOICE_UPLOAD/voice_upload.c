@@ -49,6 +49,7 @@ typedef struct {
   int response_id;
   int speech_index;
   int chunk_index;
+  int64_t meta_us;
   char *text;
 } tts_audio_rx_t;
 
@@ -238,6 +239,7 @@ static void handle_tts_audio_json(const cJSON *root)
   s_tts_audio_rx.response_id = cJSON_IsNumber(response_id) ? response_id->valueint : -1;
   s_tts_audio_rx.speech_index = cJSON_IsNumber(speech_index) ? speech_index->valueint : -1;
   s_tts_audio_rx.chunk_index = cJSON_IsNumber(chunk_index) ? chunk_index->valueint : -1;
+  s_tts_audio_rx.meta_us = esp_timer_get_time();
   s_tts_audio_rx.text = take_tts_text(s_tts_audio_rx.response_id, s_tts_audio_rx.speech_index);
 
   ESP_LOGI(TAG,
@@ -326,6 +328,15 @@ static void handle_server_binary(const uint8_t *data, int len)
   if (s_tts_audio_rx.received_bytes < s_tts_audio_rx.expected_bytes) {
     return;
   }
+
+  int64_t receive_us = esp_timer_get_time() - s_tts_audio_rx.meta_us;
+  ESP_LOGI(TAG,
+           "TTS PCM complete: response=%d speech=%d chunk=%d bytes=%u receive=%lld ms",
+           s_tts_audio_rx.response_id,
+           s_tts_audio_rx.speech_index,
+           s_tts_audio_rx.chunk_index,
+           (unsigned)s_tts_audio_rx.expected_bytes,
+           (long long)(receive_us / 1000));
 
   esp_err_t err = audio_queue_pcm_s16le_with_text(s_tts_audio_rx.data,
                                                   s_tts_audio_rx.expected_bytes,

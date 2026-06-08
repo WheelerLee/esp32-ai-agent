@@ -9,6 +9,7 @@
 #include "esp_check.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -37,8 +38,16 @@ enum {
   audio_volume_default_level = 6,
   audio_volume_percent_per_level = 20,
   audio_pcm_queue_depth = 16,
-  audio_pcm_play_task_stack = 6144,
-  audio_pcm_play_task_priority = 5,
+  audio_i2s_dma_desc_num = 12,
+  audio_i2s_dma_frame_num = 512,
+  audio_pcm_play_task_stack = 8192,
+  audio_pcm_play_task_priority = 7,
+  audio_playback_tail_silence_ms = 80,
+  audio_i2s_idle_stop_delay_ms = 700,
+  audio_start_prebuffer_ms = 350,
+  audio_mono_write_chunk_frames = 4096,
+  audio_text_task_stack = 4096,
+  audio_text_task_priority = 4,
 };
 
 typedef struct {
@@ -47,6 +56,7 @@ typedef struct {
   size_t bytes;
   uint32_t sample_rate_hz;
   int channels;
+  int64_t enqueue_us;
 } audio_pcm_queue_item_t;
 
 static char *audio_strdup(const char *text)
@@ -61,6 +71,41 @@ static char *audio_strdup(const char *text)
     memcpy(copy, text, len + 1);
   }
   return copy;
+}
+
+static void audio_text_task(void *arg)
+{
+  char *text = (char *)arg;
+  audio_pcm_playback_text_cb_t cb = s_pcm_playback_text_cb;
+  if (cb != nullptr) {
+    cb(text != nullptr ? text : "");
+  }
+  free(text);
+  vTaskDelete(nullptr);
+}
+
+static void audio_notify_playback_text_async(const char *text)
+{
+  if (s_pcm_playback_text_cb == nullptr || text == nullptr || text[0] == '\0') {
+    return;
+  }
+
+  char *text_copy = audio_strdup(text);
+  if (text_copy == nullptr) {
+    ESP_LOGW(TAG, "copy playback text for async UI update failed");
+    return;
+  }
+
+  BaseType_t task_ret = xTaskCreate(audio_text_task,
+                                    "audio_text",
+                                    audio_text_task_stack,
+                                    text_copy,
+                                    audio_text_task_priority,
+                                    nullptr);
+  if (task_ret != pdPASS) {
+    ESP_LOGW(TAG, "create playback text task failed");
+    free(text_copy);
+  }
 }
 
 static int audio_clamp_volume_level(int volume_level)
@@ -283,12 +328,14 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
     return err;
   }
 
-  int16_t stereo[256 * 2];
+  int16_t *stereo = (int16_t *)malloc(audio_mono_write_chunk_frames * 2 * sizeof(int16_t));
+  ESP_RETURN_ON_FALSE(stereo != nullptr, ESP_ERR_NO_MEM, TAG, "allocate mono conversion buffer failed");
+
   size_t offset = 0;
   while (offset < samples_per_channel) {
     size_t chunk = samples_per_channel - offset;
-    if (chunk > 256) {
-      chunk = 256;
+    if (chunk > audio_mono_write_chunk_frames) {
+      chunk = audio_mono_write_chunk_frames;
     }
 
     for (size_t i = 0; i < chunk; ++i) {
@@ -298,13 +345,16 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
 
     size_t bytes_written = 0;
     size_t expected_bytes = chunk * 2 * sizeof(int16_t);
-    ESP_RETURN_ON_ERROR(i2s_channel_write(s_i2s_tx_chan,
-                                          stereo,
-                                          expected_bytes,
-                                          &bytes_written,
-                                          portMAX_DELAY),
-                        TAG,
-                        "write mono PCM failed");
+    esp_err_t err = i2s_channel_write(s_i2s_tx_chan,
+                                      stereo,
+                                      expected_bytes,
+                                      &bytes_written,
+                                      portMAX_DELAY);
+    if (err != ESP_OK) {
+      free(stereo);
+      ESP_LOGE(TAG, "write mono PCM failed: %s", esp_err_to_name(err));
+      return err;
+    }
     if (bytes_written != expected_bytes) {
       ESP_LOGW(TAG, "partial I2S mono write: %u/%u bytes", (unsigned)bytes_written, (unsigned)expected_bytes);
     }
@@ -315,16 +365,64 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
   if (bytes_written_total != nullptr) {
     *bytes_written_total = total_written;
   }
+  free(stereo);
+  return ESP_OK;
+}
+
+static esp_err_t audio_write_tail_silence(uint32_t sample_rate_hz)
+{
+  if (sample_rate_hz == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  int16_t silence[128 * 2] = {};
+  size_t silence_frames = (size_t)sample_rate_hz * audio_playback_tail_silence_ms / 1000;
+  while (silence_frames > 0) {
+    size_t chunk = silence_frames;
+    if (chunk > 128) {
+      chunk = 128;
+    }
+
+    size_t bytes_written = 0;
+    ESP_RETURN_ON_ERROR(audio_write_pcm(silence, chunk, 2, &bytes_written),
+                        TAG,
+                        "write playback tail silence failed");
+    silence_frames -= chunk;
+  }
+
+  return ESP_OK;
+}
+
+static esp_err_t audio_stop_i2s_when_idle(void)
+{
+  if (!s_i2s_enabled || s_pcm_queue == nullptr || uxQueueMessagesWaiting(s_pcm_queue) > 0) {
+    return ESP_OK;
+  }
+
+  ESP_RETURN_ON_ERROR(audio_write_tail_silence(s_current_sample_rate),
+                      TAG,
+                      "flush playback tail failed");
+  ESP_RETURN_ON_ERROR(i2s_channel_disable(s_i2s_tx_chan), TAG, "disable idle I2S tx failed");
+  s_i2s_enabled = false;
   return ESP_OK;
 }
 
 static void audio_pcm_play_task(void *arg)
 {
   (void)arg;
+  bool playback_idle = true;
 
   while (true) {
     audio_pcm_queue_item_t item = {};
-    if (xQueueReceive(s_pcm_queue, &item, portMAX_DELAY) != pdTRUE) {
+    if (xQueueReceive(s_pcm_queue, &item, pdMS_TO_TICKS(audio_i2s_idle_stop_delay_ms)) != pdTRUE) {
+      if (xSemaphoreTake(s_audio_mutex, portMAX_DELAY) == pdTRUE) {
+        esp_err_t idle_ret = audio_stop_i2s_when_idle();
+        if (idle_ret != ESP_OK) {
+          ESP_LOGW(TAG, "stop idle I2S failed: %s", esp_err_to_name(idle_ret));
+        }
+        xSemaphoreGive(s_audio_mutex);
+      }
+      playback_idle = true;
       continue;
     }
 
@@ -332,6 +430,10 @@ static void audio_pcm_play_task(void *arg)
       free(item.data);
       free(item.text);
       continue;
+    }
+
+    if (playback_idle) {
+      vTaskDelay(pdMS_TO_TICKS(audio_start_prebuffer_ms));
     }
 
     if (xSemaphoreTake(s_audio_mutex, portMAX_DELAY) != pdTRUE) {
@@ -342,9 +444,7 @@ static void audio_pcm_play_task(void *arg)
 
     esp_err_t ret = audio_configure_i2s(item.sample_rate_hz);
     if (ret == ESP_OK) {
-      if (s_pcm_playback_text_cb != nullptr && item.text != nullptr && item.text[0] != '\0') {
-        s_pcm_playback_text_cb(item.text);
-      }
+      audio_notify_playback_text_async(item.text);
 
       size_t sample_count = item.bytes / sizeof(int16_t);
       int16_t *pcm = (int16_t *)item.data;
@@ -354,15 +454,23 @@ static void audio_pcm_play_task(void *arg)
 
       size_t samples_per_channel = sample_count / (size_t)item.channels;
       size_t bytes_written = 0;
+      int64_t write_start_us = esp_timer_get_time();
       ret = audio_write_pcm(pcm, samples_per_channel, item.channels, &bytes_written);
+      int64_t write_us = esp_timer_get_time() - write_start_us;
       if (ret != ESP_OK) {
         ESP_LOGE(TAG, "write queued PCM failed: %s", esp_err_to_name(ret));
       } else if (bytes_written > 0) {
+        uint32_t audio_ms = (uint32_t)(samples_per_channel * 1000U / item.sample_rate_hz);
+        int64_t queue_wait_us = write_start_us - item.enqueue_us;
         ESP_LOGI(TAG,
-                 "queued PCM played: %u bytes, %lu Hz, channels=%d, volume=%d/10, peak=%d, peak_out=%d, i2s=%u",
+                 "queued PCM played: %u bytes, %lu Hz, channels=%d, audio_ms=%u queue_wait=%lld ms write=%lld ms q_left=%u volume=%d/10 peak=%d peak_out=%d i2s=%u",
                  (unsigned)item.bytes,
                  (unsigned long)item.sample_rate_hz,
                  item.channels,
+                 (unsigned)audio_ms,
+                 (long long)(queue_wait_us / 1000),
+                 (long long)(write_us / 1000),
+                 (unsigned)uxQueueMessagesWaiting(s_pcm_queue),
                  audio_get_volume_level(),
                  peak_before_gain,
                  peak_after_gain,
@@ -376,6 +484,7 @@ static void audio_pcm_play_task(void *arg)
     }
 
     xSemaphoreGive(s_audio_mutex);
+    playback_idle = false;
     free(item.data);
     free(item.text);
   }
@@ -393,6 +502,10 @@ extern "C" esp_err_t audio_init(void)
   ESP_RETURN_ON_FALSE(s_audio_mutex != nullptr, ESP_ERR_NO_MEM, TAG, "create audio mutex failed");
 
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  chan_cfg.dma_desc_num = audio_i2s_dma_desc_num;
+  chan_cfg.dma_frame_num = audio_i2s_dma_frame_num;
+  chan_cfg.auto_clear_after_cb = true;
+  chan_cfg.auto_clear_before_cb = true;
   ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_i2s_tx_chan, nullptr),
                       TAG,
                       "create I2S tx channel failed");
@@ -426,20 +539,24 @@ extern "C" esp_err_t audio_init(void)
   s_pcm_queue = xQueueCreate(audio_pcm_queue_depth, sizeof(audio_pcm_queue_item_t));
   ESP_RETURN_ON_FALSE(s_pcm_queue != nullptr, ESP_ERR_NO_MEM, TAG, "create PCM queue failed");
 
-  BaseType_t task_ret = xTaskCreate(audio_pcm_play_task,
-                                    "audio_pcm_play",
-                                    audio_pcm_play_task_stack,
-                                    nullptr,
-                                    audio_pcm_play_task_priority,
-                                    &s_pcm_play_task_handle);
+  BaseType_t task_ret = xTaskCreatePinnedToCore(audio_pcm_play_task,
+                                                "audio_pcm_play",
+                                                audio_pcm_play_task_stack,
+                                                nullptr,
+                                                audio_pcm_play_task_priority,
+                                                &s_pcm_play_task_handle,
+                                                1);
   ESP_RETURN_ON_FALSE(task_ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create PCM playback task failed");
 
   ESP_LOGI(TAG,
-           "MAX98357A I2S ready: BCLK=%d LRCLK=%d DIN=%d volume=%d/10",
+           "MAX98357A I2S ready: BCLK=%d LRCLK=%d DIN=%d volume=%d/10 dma=%dx%d task_prio=%d",
            AUDIO_I2S_PIN_BCLK,
            AUDIO_I2S_PIN_LRCLK,
            AUDIO_I2S_PIN_DIN,
-           audio_get_volume_level());
+           audio_get_volume_level(),
+           audio_i2s_dma_desc_num,
+           audio_i2s_dma_frame_num,
+           audio_pcm_play_task_priority);
   return ESP_OK;
 }
 
@@ -486,6 +603,7 @@ extern "C" esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
     .bytes = bytes,
     .sample_rate_hz = sample_rate_hz,
     .channels = channels,
+    .enqueue_us = esp_timer_get_time(),
   };
 
   if (xQueueSend(s_pcm_queue, &item, portMAX_DELAY) != pdTRUE) {
