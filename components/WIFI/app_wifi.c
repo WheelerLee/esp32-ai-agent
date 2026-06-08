@@ -15,11 +15,12 @@
 
 static const char *TAG = "app_wifi";
 
-#define APP_WIFI_NVS_NAMESPACE "wifi"
+#define APP_WIFI_NVS_NAMESPACE "app_wifi"
+#define APP_WIFI_LEGACY_NVS_NAMESPACE "wifi"
 #define APP_WIFI_NVS_KEY_SSID "ssid"
 #define APP_WIFI_NVS_KEY_PASSWORD "password"
 #define APP_WIFI_PASSWORD_MAX_LEN 64
-#define APP_WIFI_RETRY_DELAY_MS (60 * 1000)
+#define APP_WIFI_RETRY_DELAY_MS (3 * 1000)
 #define APP_WIFI_MAX_RETRIES 5
 
 static SemaphoreHandle_t s_status_mutex;
@@ -72,10 +73,10 @@ static esp_err_t init_nvs(void)
   return err;
 }
 
-static esp_err_t load_saved_credentials(void)
+static esp_err_t load_credentials_from_namespace(const char *namespace_name, bool ignore_schema_error)
 {
   nvs_handle_t nvs_handle;
-  esp_err_t err = nvs_open(APP_WIFI_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+  esp_err_t err = nvs_open(namespace_name, NVS_READONLY, &nvs_handle);
   if (err == ESP_ERR_NVS_NOT_FOUND) {
     return ESP_OK;
   }
@@ -89,6 +90,11 @@ static esp_err_t load_saved_credentials(void)
     return ESP_OK;
   }
   if (err != ESP_OK) {
+    if (ignore_schema_error) {
+      s_saved_ssid[0] = '\0';
+      nvs_close(nvs_handle);
+      return ESP_OK;
+    }
     nvs_close(nvs_handle);
     ESP_RETURN_ON_ERROR(err, TAG, "read saved SSID failed");
   }
@@ -98,11 +104,14 @@ static esp_err_t load_saved_credentials(void)
   if (err == ESP_ERR_NVS_NOT_FOUND) {
     s_saved_password[0] = '\0';
     err = ESP_OK;
+  } else if (err != ESP_OK && ignore_schema_error) {
+    s_saved_ssid[0] = '\0';
+    s_saved_password[0] = '\0';
+    err = ESP_OK;
   }
   nvs_close(nvs_handle);
 
   ESP_RETURN_ON_ERROR(err, TAG, "read saved password failed");
-  ESP_LOGI(TAG, "loaded saved WiFi SSID: %s", s_saved_ssid);
   return ESP_OK;
 }
 
@@ -126,6 +135,32 @@ static esp_err_t save_credentials(const char *ssid, const char *password)
   strlcpy(s_saved_ssid, ssid, sizeof(s_saved_ssid));
   strlcpy(s_saved_password, password != NULL ? password : "", sizeof(s_saved_password));
   ESP_LOGI(TAG, "saved WiFi credentials for SSID: %s", s_saved_ssid);
+  return ESP_OK;
+}
+
+static esp_err_t load_saved_credentials(void)
+{
+  ESP_RETURN_ON_ERROR(load_credentials_from_namespace(APP_WIFI_NVS_NAMESPACE, false),
+                      TAG,
+                      "load saved WiFi credentials failed");
+  if (s_saved_ssid[0] != '\0') {
+    ESP_LOGI(TAG, "loaded saved WiFi SSID: %s", s_saved_ssid);
+    return ESP_OK;
+  }
+
+  ESP_RETURN_ON_ERROR(load_credentials_from_namespace(APP_WIFI_LEGACY_NVS_NAMESPACE, true),
+                      TAG,
+                      "load legacy WiFi credentials failed");
+  if (s_saved_ssid[0] != '\0') {
+    char migrated_ssid[APP_WIFI_SSID_MAX_LEN + 1];
+    char migrated_password[APP_WIFI_PASSWORD_MAX_LEN + 1];
+    strlcpy(migrated_ssid, s_saved_ssid, sizeof(migrated_ssid));
+    strlcpy(migrated_password, s_saved_password, sizeof(migrated_password));
+    ESP_LOGI(TAG, "loaded legacy saved WiFi SSID: %s", s_saved_ssid);
+    ESP_RETURN_ON_ERROR(save_credentials(migrated_ssid, migrated_password),
+                        TAG,
+                        "migrate WiFi credentials failed");
+  }
   return ESP_OK;
 }
 
@@ -312,7 +347,7 @@ esp_err_t app_wifi_init(void)
                       "register IP event handler failed");
 
   ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set WiFi STA mode failed");
-  ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_FLASH), TAG, "set WiFi storage failed");
+  ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "set WiFi storage failed");
   ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start WiFi failed");
 
   s_initialized = true;

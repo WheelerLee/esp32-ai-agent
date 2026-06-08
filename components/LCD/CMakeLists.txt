@@ -14,6 +14,7 @@ set(requires
             esp_lcd_touch
             esp_lcd_touch_xpt2046
             esp_timer
+            esp_system
             lvgl
             spiffs
             WIFI)

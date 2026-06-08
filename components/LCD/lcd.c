@@ -9,6 +9,7 @@
 #include "audio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#include "esp_freertos_hooks.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_lcd_ili9341.h"
@@ -38,6 +39,8 @@ static lv_obj_t *s_home_volume_label;
 static lv_obj_t *s_home_question_label;
 static lv_obj_t *s_home_reply_label;
 static lv_timer_t *s_home_wifi_timer;
+static lv_obj_t *s_cpu_usage_label;
+static lv_timer_t *s_cpu_usage_timer;
 static lv_obj_t *s_wifi_status_label;
 static lv_obj_t *s_wifi_status_icon;
 static lv_obj_t *s_wifi_list;
@@ -54,6 +57,9 @@ static char s_home_question_text[512];
 static char s_home_reply_text[512];
 static bool s_home_reply_thinking;
 static bool s_lcd_ready;
+static volatile uint32_t s_cpu_idle_count[2];
+static uint32_t s_cpu_idle_last[2];
+static uint32_t s_cpu_idle_max[2];
 
 static void show_home_page(void);
 static void show_wifi_page(void);
@@ -63,6 +69,7 @@ static void update_wifi_status_text(void);
 static void update_wifi_status_icon(void);
 static void update_home_wifi_icon(void);
 static void stop_home_wifi_timer(void);
+static void create_cpu_usage_label(bool above_keyboard);
 static void wifi_status_changed_cb(void *user_ctx);
 static void close_keyboard(void);
 static void lvgl_lock(void);
@@ -291,6 +298,54 @@ static void lvgl_tick_cb(void *arg)
   lv_tick_inc(2);
 }
 
+static bool cpu_idle_hook(void)
+{
+  int core_id = xPortGetCoreID();
+  if (core_id >= 0 && core_id < 2) {
+    s_cpu_idle_count[core_id]++;
+  }
+  return true;
+}
+
+static uint8_t cpu_usage_from_idle_delta(uint32_t core_id, uint32_t idle_count)
+{
+  uint32_t delta = idle_count - s_cpu_idle_last[core_id];
+  s_cpu_idle_last[core_id] = idle_count;
+
+  if (delta > s_cpu_idle_max[core_id]) {
+    s_cpu_idle_max[core_id] = delta;
+  }
+  if (s_cpu_idle_max[core_id] == 0) {
+    return 0;
+  }
+
+  uint32_t idle_percent = (delta * 100U) / s_cpu_idle_max[core_id];
+  if (idle_percent > 100U) {
+    idle_percent = 100U;
+  }
+  return (uint8_t)(100U - idle_percent);
+}
+
+static void update_cpu_usage_label(void)
+{
+  if (s_cpu_usage_label == NULL) {
+    return;
+  }
+
+  uint8_t cpu0 = cpu_usage_from_idle_delta(0, s_cpu_idle_count[0]);
+  uint8_t cpu1 = cpu_usage_from_idle_delta(1, s_cpu_idle_count[1]);
+
+  char text[32];
+  snprintf(text, sizeof(text), "CPU0 %u%%  CPU1 %u%%", cpu0, cpu1);
+  lv_label_set_text(s_cpu_usage_label, text);
+}
+
+static void cpu_usage_timer_cb(lv_timer_t *timer)
+{
+  (void)timer;
+  update_cpu_usage_label();
+}
+
 static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_t *font)
 {
   lv_obj_t *label = lv_label_create(parent);
@@ -300,6 +355,22 @@ static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_
     lv_label_set_text(label, text != NULL ? text : "");
   }
   return label;
+}
+
+static void create_cpu_usage_label(bool above_keyboard)
+{
+  s_cpu_usage_label = create_label(lv_scr_act(), "CPU0 --%  CPU1 --%", ui_font());
+  if (s_cpu_usage_label == NULL) {
+    return;
+  }
+
+  lv_obj_set_width(s_cpu_usage_label, 150);
+  lv_obj_set_style_text_color(s_cpu_usage_label, lv_color_hex(0x475569), 0);
+  lv_obj_set_style_text_align(s_cpu_usage_label, LV_TEXT_ALIGN_LEFT, 0);
+  lv_label_set_long_mode(s_cpu_usage_label, LV_LABEL_LONG_CLIP);
+  lv_obj_align(s_cpu_usage_label, LV_ALIGN_BOTTOM_LEFT, 6, above_keyboard ? -102 : -4);
+  lv_obj_move_foreground(s_cpu_usage_label);
+  update_cpu_usage_label();
 }
 
 static lv_obj_t *create_button(lv_obj_t *parent,
@@ -325,6 +396,60 @@ static lv_obj_t *create_button(lv_obj_t *parent,
   lv_obj_t *label = create_label(button, text, ui_font());
   if (label != NULL) {
     lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+  }
+
+  return button;
+}
+
+static lv_obj_t *create_nav_bar(void)
+{
+  lv_obj_t *nav = lv_obj_create(lv_scr_act());
+  if (nav == NULL) {
+    return NULL;
+  }
+
+  lv_obj_set_size(nav, LCD_H_RES, 42);
+  lv_obj_align(nav, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_radius(nav, 0, 0);
+  lv_obj_set_style_border_side(nav, LV_BORDER_SIDE_BOTTOM, 0);
+  lv_obj_set_style_border_width(nav, 1, 0);
+  lv_obj_set_style_border_color(nav, lv_color_black(), 0);
+  lv_obj_set_style_bg_color(nav, lv_color_white(), 0);
+  lv_obj_set_style_pad_all(nav, 0, 0);
+
+  return nav;
+}
+
+static lv_obj_t *create_nav_label_button(lv_obj_t *parent,
+                                         const char *text,
+                                         lv_coord_t width,
+                                         lv_coord_t height,
+                                         lv_event_cb_t cb,
+                                         void *user_data)
+{
+  lv_obj_t *button = lv_obj_create(parent);
+  if (button == NULL) {
+    return NULL;
+  }
+
+  lv_obj_set_size(button, width, height);
+  lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_radius(button, 4, 0);
+  lv_obj_set_style_border_width(button, 0, 0);
+  lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_bg_color(button, lv_color_hex(0xe5e7eb), LV_STATE_PRESSED);
+  lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_STATE_PRESSED);
+  lv_obj_set_style_pad_all(button, 0, 0);
+  if (cb != NULL) {
+    lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, user_data);
+  }
+
+  lv_obj_t *label = create_label(button, text, ui_font());
+  if (label != NULL) {
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
     lv_obj_center(label);
   }
 
@@ -617,6 +742,7 @@ static void clear_screen(void)
   lv_obj_clean(lv_scr_act());
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0xf8fafc), 0);
   lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+  s_cpu_usage_label = NULL;
 }
 
 static void set_screen_bg(lv_color_t color)
@@ -897,18 +1023,8 @@ static void show_home_page(void)
   clear_screen();
   set_screen_bg(lv_color_white());
 
-  lv_obj_t *nav = lv_obj_create(lv_scr_act());
+  lv_obj_t *nav = create_nav_bar();
   if (nav != NULL) {
-    lv_obj_set_size(nav, LCD_H_RES, 42);
-    lv_obj_align(nav, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(nav, 0, 0);
-    lv_obj_set_style_border_side(nav, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_width(nav, 1, 0);
-    lv_obj_set_style_border_color(nav, lv_color_hex(0xe5e7eb), 0);
-    lv_obj_set_style_bg_color(nav, lv_color_white(), 0);
-    lv_obj_set_style_pad_all(nav, 0, 0);
-
     lv_obj_t *title = create_label(nav, "ESP32 智能助手", ui_font());
     if (title != NULL) {
       lv_obj_align(title, LV_ALIGN_LEFT_MID, 12, 0);
@@ -978,6 +1094,8 @@ static void show_home_page(void)
       lv_obj_align(volume_up_button, LV_ALIGN_RIGHT_MID, 0, 0);
     }
   }
+
+  create_cpu_usage_label(false);
 }
 
 static void show_wifi_connect_page(const char *ssid)
@@ -991,16 +1109,9 @@ static void show_wifi_connect_page(const char *ssid)
 
   clear_screen();
 
-  lv_obj_t *header = lv_obj_create(lv_scr_act());
+  lv_obj_t *header = create_nav_bar();
   if (header != NULL) {
-    lv_obj_set_size(header, LCD_H_RES, 42);
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_set_style_radius(header, 0, 0);
-    lv_obj_set_style_bg_color(header, lv_color_hex(0xe2e8f0), 0);
-    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *back = create_button(header, "返回", 72, 30, connect_back_event_cb, NULL);
+    lv_obj_t *back = create_nav_label_button(header, "返回", 72, 30, connect_back_event_cb, NULL);
     if (back != NULL) {
       lv_obj_align(back, LV_ALIGN_LEFT_MID, 4, 0);
     }
@@ -1048,6 +1159,8 @@ static void show_wifi_connect_page(const char *ssid)
       lv_keyboard_set_textarea(s_keyboard, s_password_ta);
     }
   }
+
+  create_cpu_usage_label(true);
 }
 
 static void show_wifi_page(void)
@@ -1057,16 +1170,9 @@ static void show_wifi_page(void)
   s_password_ta = NULL;
   clear_screen();
 
-  lv_obj_t *header = lv_obj_create(lv_scr_act());
+  lv_obj_t *header = create_nav_bar();
   if (header != NULL) {
-    lv_obj_set_size(header, LCD_H_RES, 42);
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_set_style_radius(header, 0, 0);
-    lv_obj_set_style_bg_color(header, lv_color_hex(0xe2e8f0), 0);
-    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *back = create_button(header, "返回", 72, 30, wifi_back_event_cb, NULL);
+    lv_obj_t *back = create_nav_label_button(header, "返回", 72, 30, wifi_back_event_cb, NULL);
     if (back != NULL) {
       lv_obj_align(back, LV_ALIGN_LEFT_MID, 4, 0);
     }
@@ -1076,7 +1182,7 @@ static void show_wifi_page(void)
       lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
     }
 
-    lv_obj_t *refresh = create_button(header, "刷新", 86, 30, wifi_refresh_event_cb, NULL);
+    lv_obj_t *refresh = create_nav_label_button(header, "刷新", 86, 30, wifi_refresh_event_cb, NULL);
     if (refresh != NULL) {
       lv_obj_align(refresh, LV_ALIGN_RIGHT_MID, -4, 0);
     }
@@ -1102,8 +1208,8 @@ static void show_wifi_page(void)
 
   s_wifi_list = lv_obj_create(lv_scr_act());
   if (s_wifi_list != NULL) {
-    lv_obj_set_size(s_wifi_list, LCD_H_RES - 16, 108);
-    lv_obj_align(s_wifi_list, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_size(s_wifi_list, LCD_H_RES - 16, 88);
+    lv_obj_align(s_wifi_list, LV_ALIGN_BOTTOM_MID, 0, -28);
     lv_obj_set_flex_flow(s_wifi_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(s_wifi_list, 6, 0);
     lv_obj_set_style_pad_row(s_wifi_list, 6, 0);
@@ -1123,6 +1229,8 @@ static void show_wifi_page(void)
   } else {
     start_wifi_scan();
   }
+
+  create_cpu_usage_label(false);
 }
 
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
@@ -1318,6 +1426,20 @@ static esp_err_t lvgl_port_init(void)
   esp_timer_handle_t tick_timer = NULL;
   ESP_RETURN_ON_ERROR(esp_timer_create(&tick_timer_args, &tick_timer), TAG, "create LVGL tick failed");
   ESP_RETURN_ON_ERROR(esp_timer_start_periodic(tick_timer, 2 * 1000), TAG, "start LVGL tick failed");
+
+  esp_err_t err = esp_register_freertos_idle_hook_for_cpu(cpu_idle_hook, 0);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "register CPU0 idle hook failed: %s", esp_err_to_name(err));
+  }
+#if portNUM_PROCESSORS > 1
+  err = esp_register_freertos_idle_hook_for_cpu(cpu_idle_hook, 1);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "register CPU1 idle hook failed: %s", esp_err_to_name(err));
+  }
+#endif
+
+  s_cpu_usage_timer = lv_timer_create(cpu_usage_timer_cb, 1000, NULL);
+  ESP_RETURN_ON_FALSE(s_cpu_usage_timer != NULL, ESP_ERR_NO_MEM, TAG, "create CPU usage timer failed");
 
   // The LVGL task runs the timer handler; UI changes from other tasks must lock first.
   BaseType_t ret = xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 5, &s_lvgl_task_handle);
