@@ -6,7 +6,7 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(lesson1)
 
 spiffs_create_partition_image(font font_active FLASH_IN_PROJECT
-                              DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/font_active/llm_text_14.bin)
+                              DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/font_active/llm_text_14_lazy.bin)
 
 # Work around a Windows ESP32-S3 toolchain ICE seen while compiling
 # esp_lcd/rgb/esp_lcd_panel_rgb.c in rgb_panel_draw_bitmap. This project uses

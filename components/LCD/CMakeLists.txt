@@ -1,5 +1,6 @@
 set(srcs
             lcd.c
+            lazy_font.c
             lv_font_chinese_16.c)
 
 set(include_dirs

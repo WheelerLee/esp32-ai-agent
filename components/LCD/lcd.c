@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lazy_font.h"
 #include "lvgl.h"
 
 static const char *TAG = "lcd";
@@ -39,9 +40,7 @@ static lv_obj_t *s_keyboard;
 static esp_lcd_touch_handle_t s_touch_handle;
 static SemaphoreHandle_t s_lvgl_mutex;
 static TaskHandle_t s_lvgl_task_handle;
-static lv_font_t *s_external_chinese_font;
-static bool s_font_fs_ready;
-static uint32_t s_font_fs_io_count;
+static const lv_font_t *s_external_chinese_font;
 static app_wifi_ap_record_t s_scan_results[APP_WIFI_MAX_APS];
 static size_t s_scan_count;
 static char s_selected_ssid[APP_WIFI_SSID_MAX_LEN + 1];
@@ -57,138 +56,12 @@ static void lvgl_unlock(void);
 #define LCD_PLAY_URL "http://192.168.1.254:5500/music.mp3"
 #define LCD_FONT_MOUNT_POINT "/font"
 #define LCD_FONT_PARTITION_LABEL "font"
-#define LCD_FONT_FILE_NAME "llm_text_14.bin"
-#define LCD_FONT_LVGL_PATH "F:/" LCD_FONT_FILE_NAME
-#define LCD_FONT_FS_YIELD_INTERVAL 64
+#define LCD_FONT_FILE_NAME "llm_text_14_lazy.bin"
+#define LCD_FONT_PATH LCD_FONT_MOUNT_POINT "/" LCD_FONT_FILE_NAME
 
 static const lv_font_t *ui_font(void)
 {
   return s_external_chinese_font != NULL ? s_external_chinese_font : &lv_font_chinese_16;
-}
-
-static bool font_fs_ready_cb(lv_fs_drv_t *drv)
-{
-  (void)drv;
-  return s_font_fs_ready;
-}
-
-static void *font_fs_open_cb(lv_fs_drv_t *drv, const char *path, lv_fs_mode_t mode)
-{
-  (void)drv;
-
-  if ((mode & LV_FS_MODE_WR) != 0 || path == NULL) {
-    return NULL;
-  }
-
-  char full_path[128];
-  int written = snprintf(full_path,
-                         sizeof(full_path),
-                         "%s%s%s",
-                         LCD_FONT_MOUNT_POINT,
-                         path[0] == '/' ? "" : "/",
-                         path);
-  if (written < 0 || written >= (int)sizeof(full_path)) {
-    return NULL;
-  }
-
-  return fopen(full_path, "rb");
-}
-
-static void font_fs_yield(void)
-{
-  if (++s_font_fs_io_count >= LCD_FONT_FS_YIELD_INTERVAL) {
-    s_font_fs_io_count = 0;
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
-}
-
-static lv_fs_res_t font_fs_close_cb(lv_fs_drv_t *drv, void *file_p)
-{
-  (void)drv;
-  return fclose((FILE *)file_p) == 0 ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
-}
-
-static lv_fs_res_t font_fs_read_cb(lv_fs_drv_t *drv, void *file_p, void *buf, uint32_t btr, uint32_t *br)
-{
-  (void)drv;
-
-  size_t read_count = fread(buf, 1, btr, (FILE *)file_p);
-  if (br != NULL) {
-    *br = read_count;
-  }
-  font_fs_yield();
-  return ferror((FILE *)file_p) == 0 ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
-}
-
-static lv_fs_res_t font_fs_seek_cb(lv_fs_drv_t *drv, void *file_p, uint32_t pos, lv_fs_whence_t whence)
-{
-  (void)drv;
-
-  int origin = SEEK_SET;
-  if (whence == LV_FS_SEEK_CUR) {
-    origin = SEEK_CUR;
-  } else if (whence == LV_FS_SEEK_END) {
-    origin = SEEK_END;
-  }
-
-  int ret = fseek((FILE *)file_p, (long)pos, origin);
-  font_fs_yield();
-  return ret == 0 ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
-}
-
-static lv_fs_res_t font_fs_tell_cb(lv_fs_drv_t *drv, void *file_p, uint32_t *pos_p)
-{
-  (void)drv;
-
-  long pos = ftell((FILE *)file_p);
-  if (pos < 0) {
-    return LV_FS_RES_UNKNOWN;
-  }
-  if (pos_p != NULL) {
-    *pos_p = (uint32_t)pos;
-  }
-  return LV_FS_RES_OK;
-}
-
-static bool is_lvgl_bin_font_file(void)
-{
-  char full_path[128];
-  int written = snprintf(full_path, sizeof(full_path), "%s/%s", LCD_FONT_MOUNT_POINT, LCD_FONT_FILE_NAME);
-  if (written < 0 || written >= (int)sizeof(full_path)) {
-    return false;
-  }
-
-  FILE *file = fopen(full_path, "rb");
-  if (file == NULL) {
-    return false;
-  }
-
-  uint8_t header[8] = {0};
-  size_t read_count = fread(header, 1, sizeof(header), file);
-  fclose(file);
-
-  return read_count == sizeof(header) && header[0] == 0x30 && memcmp(&header[4], "head", 4) == 0;
-}
-
-static void register_font_lvgl_fs(void)
-{
-  static bool s_registered;
-  static lv_fs_drv_t s_font_drv;
-
-  if (s_registered) {
-    return;
-  }
-
-  lv_fs_drv_init(&s_font_drv);
-  s_font_drv.letter = 'F';
-  s_font_drv.ready_cb = font_fs_ready_cb;
-  s_font_drv.open_cb = font_fs_open_cb;
-  s_font_drv.close_cb = font_fs_close_cb;
-  s_font_drv.read_cb = font_fs_read_cb;
-  s_font_drv.seek_cb = font_fs_seek_cb;
-  s_font_drv.tell_cb = font_fs_tell_cb;
-  lv_fs_drv_register(&s_font_drv);
-  s_registered = true;
 }
 
 static void load_external_font(void)
@@ -210,25 +83,14 @@ static void load_external_font(void)
     return;
   }
 
-  s_font_fs_ready = true;
-  register_font_lvgl_fs();
-
   int64_t start_us = esp_timer_get_time();
-  if (!is_lvgl_bin_font_file()) {
-    ESP_LOGW(TAG,
-             "unsupported LVGL font file format: %s, checked in %lld ms",
-             LCD_FONT_LVGL_PATH,
-             (long long)((esp_timer_get_time() - start_us) / 1000));
-    return;
-  }
-
-  s_external_chinese_font = lv_font_load(LCD_FONT_LVGL_PATH);
+  s_external_chinese_font = lazy_font_load(LCD_FONT_PATH, &lv_font_chinese_16);
   if (s_external_chinese_font == NULL) {
-    ESP_LOGW(TAG, "load external font failed: %s", LCD_FONT_LVGL_PATH);
+    ESP_LOGW(TAG, "load external font failed: %s", LCD_FONT_PATH);
   } else {
     ESP_LOGI(TAG,
              "loaded external font: %s in %lld ms",
-             LCD_FONT_LVGL_PATH,
+             LCD_FONT_PATH,
              (long long)((esp_timer_get_time() - start_us) / 1000));
   }
 }

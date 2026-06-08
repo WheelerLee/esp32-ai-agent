@@ -31,16 +31,13 @@ WiFi 当前只支持 DHCP 获取 IP，TCP/IP 使用 ESP-IDF 默认的 `esp_netif
 | 触摸驱动依赖 | `atanisoft/esp_lcd_touch_xpt2046 ^1.0.6` |
 | LVGL 依赖 | `lvgl/lvgl ~8.3.11` |
 | LVGL 内存 | `CONFIG_LV_MEM_CUSTOM=y` |
-| 中文显示 | 默认从独立 `font` SPIFFS 分区加载 `llm_text_14.bin`，覆盖 ASCII、常用汉字和常见中文标点 |
+| 中文显示 | 默认从独立 `font` SPIFFS 分区加载 `llm_text_14_lazy.bin`，覆盖 ASCII、常用汉字和常见中文标点 |
 
 当前大模型回复字库由 `fonts/puhui.ttf` 和 `fonts/常用字.txt` 生成，命令记录在
-`fonts/readme.md`。LVGL 8.3 也支持 `lv_font_conv --format bin` 生成的二进制
-字体文件；工程中保留了 `fonts/llm_text_14.bin`，并把同一文件放入
-`font_active/` 用于生成 `font` 分区镜像。LCD 初始化时会
-挂载 `/font`，注册 LVGL 的 `F:` 文件系统驱动，并通过
-`lv_font_load("F:/llm_text_14.bin")` 加载字体。若字体分区未刷入或
-加载失败，会回退到 `components/LCD/lv_font_chinese_16.c` 中的小型内置字体。
-由于二进制字体加载时会占用较多动态内存，工程已启用 `CONFIG_LV_MEM_CUSTOM=y`。
+`fonts/readme.md`。工程使用自定义 lazy 字体格式：LCD 初始化时只从 `/font`
+读取字体头和 glyph 索引，具体字形 bitmap 在绘制文字时按字读取并缓存，避免
+`lv_font_load()` 在开机阶段解析完整字体。若字体分区未刷入或加载失败，会回退到
+`components/LCD/lv_font_chinese_16.c` 中的小型内置字体。
 
 ## ILI9341 接线
 
