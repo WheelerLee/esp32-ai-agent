@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "key.h"
+#include "lcd.h"
 
 static const char *TAG = "voice_upload";
 
@@ -29,6 +30,7 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_FRAMES_PER_CHUNK 512
 #define VOICE_UPLOAD_MIC_SHIFT 14
 #define VOICE_UPLOAD_WS_RX_BUFFER_BYTES 4096
+#define VOICE_UPLOAD_TTS_TEXT_SLOTS 4
 
 static i2s_chan_handle_t s_i2s_rx_chan;
 static esp_websocket_client_handle_t s_ws_client;
@@ -47,14 +49,146 @@ typedef struct {
   int response_id;
   int speech_index;
   int chunk_index;
+  char *text;
 } tts_audio_rx_t;
 
+typedef struct {
+  bool active;
+  int response_id;
+  int speech_index;
+  char *text;
+} tts_text_slot_t;
+
 static tts_audio_rx_t s_tts_audio_rx;
+static tts_text_slot_t s_tts_text_slots[VOICE_UPLOAD_TTS_TEXT_SLOTS];
+
+static char *voice_upload_strdup(const char *text)
+{
+  if (text == NULL || text[0] == '\0') {
+    return NULL;
+  }
+
+  size_t len = strlen(text);
+  char *copy = (char *)malloc(len + 1);
+  if (copy != NULL) {
+    memcpy(copy, text, len + 1);
+  }
+  return copy;
+}
 
 static void clear_pending_tts_audio(void)
 {
   free(s_tts_audio_rx.data);
+  free(s_tts_audio_rx.text);
   memset(&s_tts_audio_rx, 0, sizeof(s_tts_audio_rx));
+}
+
+static void clear_tts_text_slot(tts_text_slot_t *slot)
+{
+  if (slot == NULL) {
+    return;
+  }
+
+  free(slot->text);
+  memset(slot, 0, sizeof(*slot));
+}
+
+static void clear_pending_tts_texts(void)
+{
+  for (size_t i = 0; i < VOICE_UPLOAD_TTS_TEXT_SLOTS; ++i) {
+    clear_tts_text_slot(&s_tts_text_slots[i]);
+  }
+}
+
+static bool tts_ids_match(const tts_text_slot_t *slot, int response_id, int speech_index)
+{
+  return slot != NULL &&
+         slot->active &&
+         slot->response_id == response_id &&
+         slot->speech_index == speech_index;
+}
+
+static void remember_tts_text(int response_id, int speech_index, const char *text)
+{
+  if (response_id < 0 || speech_index < 0 || text == NULL || text[0] == '\0') {
+    return;
+  }
+
+  char *copy = voice_upload_strdup(text);
+  if (copy == NULL) {
+    ESP_LOGW(TAG, "copy TTS text failed");
+    return;
+  }
+
+  tts_text_slot_t *slot = NULL;
+  for (size_t i = 0; i < VOICE_UPLOAD_TTS_TEXT_SLOTS; ++i) {
+    if (tts_ids_match(&s_tts_text_slots[i], response_id, speech_index)) {
+      slot = &s_tts_text_slots[i];
+      break;
+    }
+  }
+  if (slot == NULL) {
+    for (size_t i = 0; i < VOICE_UPLOAD_TTS_TEXT_SLOTS; ++i) {
+      if (!s_tts_text_slots[i].active) {
+        slot = &s_tts_text_slots[i];
+        break;
+      }
+    }
+  }
+  if (slot == NULL) {
+    slot = &s_tts_text_slots[0];
+  }
+
+  clear_tts_text_slot(slot);
+  slot->active = true;
+  slot->response_id = response_id;
+  slot->speech_index = speech_index;
+  slot->text = copy;
+}
+
+static char *take_tts_text(int response_id, int speech_index)
+{
+  for (size_t i = 0; i < VOICE_UPLOAD_TTS_TEXT_SLOTS; ++i) {
+    tts_text_slot_t *slot = &s_tts_text_slots[i];
+    if (!tts_ids_match(slot, response_id, speech_index)) {
+      continue;
+    }
+
+    char *text = slot->text;
+    slot->text = NULL;
+    clear_tts_text_slot(slot);
+    return text;
+  }
+
+  return NULL;
+}
+
+static void handle_tts_start_json(const cJSON *root)
+{
+  const cJSON *response_id = cJSON_GetObjectItem(root, "responseId");
+  const cJSON *speech_index = cJSON_GetObjectItem(root, "speechIndex");
+  const cJSON *text = cJSON_GetObjectItem(root, "text");
+
+  if (!cJSON_IsNumber(response_id) ||
+      !cJSON_IsNumber(speech_index) ||
+      !cJSON_IsString(text)) {
+    ESP_LOGW(TAG, "invalid tts_start metadata");
+    return;
+  }
+
+  remember_tts_text(response_id->valueint, speech_index->valueint, text->valuestring);
+}
+
+static void handle_asr_result_json(const cJSON *root)
+{
+  const cJSON *text = cJSON_GetObjectItem(root, "text");
+
+  if (!cJSON_IsString(text)) {
+    ESP_LOGW(TAG, "invalid asr_result metadata");
+    return;
+  }
+
+  lcd_show_user_question(text->valuestring);
 }
 
 static void handle_tts_audio_json(const cJSON *root)
@@ -104,15 +238,17 @@ static void handle_tts_audio_json(const cJSON *root)
   s_tts_audio_rx.response_id = cJSON_IsNumber(response_id) ? response_id->valueint : -1;
   s_tts_audio_rx.speech_index = cJSON_IsNumber(speech_index) ? speech_index->valueint : -1;
   s_tts_audio_rx.chunk_index = cJSON_IsNumber(chunk_index) ? chunk_index->valueint : -1;
+  s_tts_audio_rx.text = take_tts_text(s_tts_audio_rx.response_id, s_tts_audio_rx.speech_index);
 
   ESP_LOGI(TAG,
-           "expect TTS PCM: response=%d speech=%d chunk=%d bytes=%u rate=%lu channels=%d",
+           "expect TTS PCM: response=%d speech=%d chunk=%d bytes=%u rate=%lu channels=%d text=%s",
            s_tts_audio_rx.response_id,
            s_tts_audio_rx.speech_index,
            s_tts_audio_rx.chunk_index,
            (unsigned)s_tts_audio_rx.expected_bytes,
            (unsigned long)s_tts_audio_rx.sample_rate_hz,
-           s_tts_audio_rx.channels);
+           s_tts_audio_rx.channels,
+           s_tts_audio_rx.text != NULL ? s_tts_audio_rx.text : "");
 }
 
 static void handle_server_json(const char *json, int len)
@@ -140,7 +276,13 @@ static void handle_server_json(const char *json, int len)
     return;
   }
 
-  if (strcmp(type->valuestring, "tts_audio") == 0) {
+  if (strcmp(type->valuestring, "asr_result") == 0) {
+    handle_asr_result_json(root);
+    ESP_LOGI(TAG, "server: %.*s", len, json);
+  } else if (strcmp(type->valuestring, "tts_start") == 0) {
+    handle_tts_start_json(root);
+    ESP_LOGI(TAG, "server: %.*s", len, json);
+  } else if (strcmp(type->valuestring, "tts_audio") == 0) {
     handle_tts_audio_json(root);
   } else if (strcmp(type->valuestring, "error") == 0) {
     const cJSON *stage = cJSON_GetObjectItem(root, "stage");
@@ -185,10 +327,11 @@ static void handle_server_binary(const uint8_t *data, int len)
     return;
   }
 
-  esp_err_t err = audio_queue_pcm_s16le(s_tts_audio_rx.data,
-                                        s_tts_audio_rx.expected_bytes,
-                                        s_tts_audio_rx.sample_rate_hz,
-                                        s_tts_audio_rx.channels);
+  esp_err_t err = audio_queue_pcm_s16le_with_text(s_tts_audio_rx.data,
+                                                  s_tts_audio_rx.expected_bytes,
+                                                  s_tts_audio_rx.sample_rate_hz,
+                                                  s_tts_audio_rx.channels,
+                                                  s_tts_audio_rx.text);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "queue TTS PCM failed: %s", esp_err_to_name(err));
   }
@@ -214,6 +357,7 @@ static void websocket_event_handler(void *handler_args,
   case WEBSOCKET_EVENT_DISCONNECTED:
     s_ws_connected = false;
     clear_pending_tts_audio();
+    clear_pending_tts_texts();
     ESP_LOGW(TAG, "WebSocket disconnected");
     break;
   case WEBSOCKET_EVENT_DATA:
@@ -388,6 +532,8 @@ static esp_err_t send_heartbeat_if_due(int64_t *last_heartbeat_us)
 
 static esp_err_t record_and_upload(void)
 {
+  lcd_show_user_speaking();
+
   if (!wifi_is_connected()) {
     ESP_LOGW(TAG, "WiFi is not connected, ignore recording request");
     return ESP_ERR_INVALID_STATE;

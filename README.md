@@ -94,8 +94,8 @@ LED 和 USB 引脚。
 | OUT+ / SPK+ | 喇叭一端 | 桥接功放输出 |
 | OUT- / SPK- | 喇叭另一端 | 不能接 GND |
 
-主页提供 `Play` 按钮，点击后会通过 HTTP 下载并播放
-`http://192.168.1.254:5500/music.mp3`。MP3 解码使用 `esphome/micro-mp3`
+主页右下角提供 0-10 档音量控制，音量会保存到 NVS，下次开机自动恢复；
+未保存过音量时默认使用 6 档。MP3 解码使用 `esphome/micro-mp3`
 组件，解码后的 16-bit PCM 通过 I2S 输出到 MAX98357A。裸 BGA/WLP 芯片建议
 做 PCB 或使用转接板，电源脚旁边放置 0.1 uF 和 10 uF 去耦电容。`SD_MODE`
 使用 1 MΩ 上拉时，单个喇叭会播放 `(Left + Right) / 2` 混音；如果后续要做

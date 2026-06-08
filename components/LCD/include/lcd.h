@@ -46,6 +46,8 @@
 #define LCD_BK_LIGHT_OFF_LEVEL !LCD_BK_LIGHT_ON_LEVEL
 
 esp_err_t lcd_init(void);
+void lcd_show_user_speaking(void);
+void lcd_show_user_question(const char *text);
 void lcd_show_text(const char *text);
 
 #endif

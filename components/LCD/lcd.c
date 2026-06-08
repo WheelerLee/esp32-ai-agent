@@ -33,7 +33,13 @@ static esp_lcd_panel_handle_t s_panel_handle;
 static lv_disp_draw_buf_t s_disp_buf;
 static lv_disp_drv_t s_disp_drv;
 static lv_indev_drv_t s_indev_drv;
+static lv_obj_t *s_home_wifi_button;
+static lv_obj_t *s_home_volume_label;
+static lv_obj_t *s_home_question_label;
+static lv_obj_t *s_home_reply_label;
+static lv_timer_t *s_home_wifi_timer;
 static lv_obj_t *s_wifi_status_label;
+static lv_obj_t *s_wifi_status_icon;
 static lv_obj_t *s_wifi_list;
 static lv_obj_t *s_password_ta;
 static lv_obj_t *s_keyboard;
@@ -44,20 +50,77 @@ static const lv_font_t *s_external_chinese_font;
 static app_wifi_ap_record_t s_scan_results[APP_WIFI_MAX_APS];
 static size_t s_scan_count;
 static char s_selected_ssid[APP_WIFI_SSID_MAX_LEN + 1];
+static char s_home_question_text[512];
+static char s_home_reply_text[512];
+static bool s_home_reply_thinking;
+static bool s_lcd_ready;
 
 static void show_home_page(void);
 static void show_wifi_page(void);
 static void show_wifi_connect_page(const char *ssid);
 static void start_wifi_scan(void);
 static void update_wifi_status_text(void);
+static void update_wifi_status_icon(void);
+static void update_home_wifi_icon(void);
+static void stop_home_wifi_timer(void);
+static void wifi_status_changed_cb(void *user_ctx);
+static void close_keyboard(void);
 static void lvgl_lock(void);
 static void lvgl_unlock(void);
 
-#define LCD_PLAY_URL "http://192.168.1.254:5500/music.mp3"
 #define LCD_FONT_MOUNT_POINT "/font"
 #define LCD_FONT_PARTITION_LABEL "font"
 #define LCD_FONT_FILE_NAME "llm_text_14_lazy.bin"
 #define LCD_FONT_PATH LCD_FONT_MOUNT_POINT "/" LCD_FONT_FILE_NAME
+#define LCD_KB_BTN(width) (LV_BTNMATRIX_CTRL_POPOVER | (width))
+
+static const char *s_kb_map_lower[] = {
+  "1#", "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "Del", "\n",
+  "ABC", "a", "s", "d", "f", "g", "h", "j", "k", "l", "Enter", "\n",
+  "_", "-", "z", "x", "c", "v", "b", "n", "m", ".", ",", ":", "\n",
+  "Hide", "Space", "Del", "OK", ""
+};
+
+static const char *s_kb_map_upper[] = {
+  "1#", "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "Del", "\n",
+  "abc", "A", "S", "D", "F", "G", "H", "J", "K", "L", "Enter", "\n",
+  "_", "-", "Z", "X", "C", "V", "B", "N", "M", ".", ",", ":", "\n",
+  "Hide", "Space", "Del", "OK", ""
+};
+
+static const char *s_kb_map_special[] = {
+  "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "Del", "\n",
+  "abc", "+", "&", "/", "*", "=", "%", "!", "?", "#", "<", ">", "\n",
+  "\\", "@", "$", "(", ")", "{", "}", "[", "]", ";", "\"", "'", "\n",
+  "Hide", "Space", "Del", "OK", ""
+};
+
+static const lv_btnmatrix_ctrl_t s_kb_ctrl_text[] = {
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 5, LCD_KB_BTN(4), LCD_KB_BTN(4), LCD_KB_BTN(4), LCD_KB_BTN(4),
+  LCD_KB_BTN(4), LCD_KB_BTN(4), LCD_KB_BTN(4), LCD_KB_BTN(4), LCD_KB_BTN(4), LCD_KB_BTN(4),
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 7,
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 6, LCD_KB_BTN(3), LCD_KB_BTN(3), LCD_KB_BTN(3), LCD_KB_BTN(3),
+  LCD_KB_BTN(3), LCD_KB_BTN(3), LCD_KB_BTN(3), LCD_KB_BTN(3), LCD_KB_BTN(3),
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 7,
+  LV_BTNMATRIX_CTRL_CHECKED | LCD_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | LCD_KB_BTN(1),
+  LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1),
+  LCD_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | LCD_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | LCD_KB_BTN(1),
+  LV_BTNMATRIX_CTRL_CHECKED | LCD_KB_BTN(1),
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 3, LV_BTNMATRIX_CTRL_CHECKED | 8,
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 3, LV_KEYBOARD_CTRL_BTN_FLAGS | 3
+};
+
+static const lv_btnmatrix_ctrl_t s_kb_ctrl_special[] = {
+  LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1),
+  LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LV_KEYBOARD_CTRL_BTN_FLAGS | 2,
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 2, LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1),
+  LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1),
+  LCD_KB_BTN(1), LCD_KB_BTN(1),
+  LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1),
+  LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1), LCD_KB_BTN(1),
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 3, LV_BTNMATRIX_CTRL_CHECKED | 8,
+  LV_KEYBOARD_CTRL_BTN_FLAGS | 3, LV_KEYBOARD_CTRL_BTN_FLAGS | 3
+};
 
 static const lv_font_t *ui_font(void)
 {
@@ -268,8 +331,248 @@ static lv_obj_t *create_button(lv_obj_t *parent,
   return button;
 }
 
+static void style_keyboard(lv_obj_t *keyboard)
+{
+  if (keyboard == NULL) {
+    return;
+  }
+
+  lv_obj_set_style_text_font(keyboard, &lv_font_chinese_16, LV_PART_ITEMS);
+  lv_obj_set_style_text_color(keyboard, lv_color_hex(0x111827), LV_PART_ITEMS);
+  lv_obj_set_style_bg_color(keyboard, lv_color_hex(0xf8fafc), 0);
+  lv_obj_set_style_bg_opa(keyboard, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(keyboard, 0, 0);
+  lv_obj_set_style_pad_all(keyboard, 3, 0);
+  lv_obj_set_style_pad_row(keyboard, 3, 0);
+  lv_obj_set_style_pad_column(keyboard, 3, 0);
+  lv_obj_set_style_radius(keyboard, 0, 0);
+  lv_obj_set_style_radius(keyboard, 4, LV_PART_ITEMS);
+  lv_obj_set_style_bg_color(keyboard, lv_color_white(), LV_PART_ITEMS);
+  lv_obj_set_style_bg_color(keyboard, lv_color_hex(0xe5e7eb), LV_PART_ITEMS | LV_STATE_CHECKED);
+  lv_obj_set_style_bg_color(keyboard, lv_color_hex(0xdbeafe), LV_PART_ITEMS | LV_STATE_PRESSED);
+  lv_obj_set_style_border_width(keyboard, 1, LV_PART_ITEMS);
+  lv_obj_set_style_border_color(keyboard, lv_color_hex(0xcbd5e1), LV_PART_ITEMS);
+}
+
+static void async_close_keyboard(void *arg)
+{
+  (void)arg;
+  close_keyboard();
+}
+
+static void keyboard_event_cb(lv_event_t *event)
+{
+  if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) {
+    return;
+  }
+
+  lv_obj_t *keyboard = lv_event_get_target(event);
+  uint16_t btn_id = lv_btnmatrix_get_selected_btn(keyboard);
+  if (btn_id == LV_BTNMATRIX_BTN_NONE) {
+    return;
+  }
+
+  const char *txt = lv_btnmatrix_get_btn_text(keyboard, btn_id);
+  if (txt == NULL) {
+    return;
+  }
+
+  if (strcmp(txt, "abc") == 0) {
+    lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+    return;
+  }
+  if (strcmp(txt, "ABC") == 0) {
+    lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_TEXT_UPPER);
+    return;
+  }
+  if (strcmp(txt, "1#") == 0) {
+    lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_SPECIAL);
+    return;
+  }
+  if (strcmp(txt, "Hide") == 0) {
+    lv_async_call(async_close_keyboard, NULL);
+    return;
+  }
+
+  lv_obj_t *textarea = lv_keyboard_get_textarea(keyboard);
+  if (textarea == NULL) {
+    return;
+  }
+
+  if (strcmp(txt, "OK") == 0) {
+    lv_event_send(textarea, LV_EVENT_READY, NULL);
+    lv_async_call(async_close_keyboard, NULL);
+  } else if (strcmp(txt, "Enter") == 0) {
+    lv_textarea_add_char(textarea, '\n');
+    if (lv_textarea_get_one_line(textarea)) {
+      lv_event_send(textarea, LV_EVENT_READY, NULL);
+      lv_async_call(async_close_keyboard, NULL);
+    }
+  } else if (strcmp(txt, "Del") == 0) {
+    lv_textarea_del_char(textarea);
+  } else if (strcmp(txt, "Space") == 0) {
+    lv_textarea_add_char(textarea, ' ');
+  } else {
+    lv_textarea_add_text(textarea, txt);
+  }
+}
+
+static void setup_keyboard(lv_obj_t *keyboard)
+{
+  if (keyboard == NULL) {
+    return;
+  }
+
+  lv_obj_remove_event_cb(keyboard, lv_keyboard_def_event_cb);
+  lv_obj_add_event_cb(keyboard, keyboard_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER, s_kb_map_lower, s_kb_ctrl_text);
+  lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_TEXT_UPPER, s_kb_map_upper, s_kb_ctrl_text);
+  lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_SPECIAL, s_kb_map_special, s_kb_ctrl_special);
+  lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
+  style_keyboard(keyboard);
+}
+
+static int wifi_signal_level_from_rssi(int8_t rssi)
+{
+  if (rssi >= -60) {
+    return 3;
+  }
+  if (rssi >= -75) {
+    return 2;
+  }
+  return 1;
+}
+
+static void create_signal_bars(lv_obj_t *parent, int level, lv_color_t active_color)
+{
+  static const lv_coord_t bar_heights[] = {6, 11, 16};
+
+  for (int i = 0; i < 3; ++i) {
+    lv_obj_t *bar = lv_obj_create(parent);
+    if (bar == NULL) {
+      continue;
+    }
+
+    lv_obj_set_size(bar, 5, bar_heights[i]);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 3 + (i * 8), -2);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(bar, 2, 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(bar,
+                              i < level ? active_color : lv_color_hex(0xcbd5e1),
+                              0);
+  }
+}
+
+static lv_obj_t *create_wifi_icon(lv_obj_t *parent, int level, bool connecting)
+{
+  lv_obj_t *icon = lv_obj_create(parent);
+  if (icon == NULL) {
+    return NULL;
+  }
+
+  lv_obj_set_size(icon, 30, 22);
+  lv_obj_clear_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_border_width(icon, 0, 0);
+  lv_obj_set_style_radius(icon, 0, 0);
+  lv_obj_set_style_pad_all(icon, 0, 0);
+  lv_obj_set_style_bg_opa(icon, LV_OPA_TRANSP, 0);
+
+  if (connecting) {
+    lv_obj_t *spinner = lv_spinner_create(icon, 1000, 70);
+    if (spinner != NULL) {
+      lv_obj_set_size(spinner, 20, 20);
+      lv_obj_center(spinner);
+      lv_obj_set_style_arc_color(spinner, lv_color_hex(0xcbd5e1), LV_PART_MAIN);
+      lv_obj_set_style_arc_color(spinner, lv_color_hex(0x2563eb), LV_PART_INDICATOR);
+      lv_obj_set_style_arc_width(spinner, 3, LV_PART_MAIN);
+      lv_obj_set_style_arc_width(spinner, 3, LV_PART_INDICATOR);
+    }
+    return icon;
+  }
+
+  if (level <= 0) {
+    create_signal_bars(icon, 0, lv_color_hex(0x94a3b8));
+
+    lv_obj_t *mark = lv_obj_create(icon);
+    if (mark != NULL) {
+      lv_obj_set_size(mark, 7, 7);
+      lv_obj_clear_flag(mark, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_set_style_radius(mark, 4, 0);
+      lv_obj_set_style_border_width(mark, 0, 0);
+      lv_obj_set_style_bg_color(mark, lv_color_hex(0xdc2626), 0);
+      lv_obj_set_style_bg_opa(mark, LV_OPA_COVER, 0);
+      lv_obj_align(mark, LV_ALIGN_RIGHT_MID, 0, -1);
+    }
+    return icon;
+  }
+
+  create_signal_bars(icon, level, lv_color_hex(0x16a34a));
+  return icon;
+}
+
+static void create_current_wifi_icon(lv_obj_t *parent)
+{
+  app_wifi_status_t status = {0};
+  app_wifi_get_status(&status);
+
+  lv_obj_t *icon = NULL;
+  if (status.connected) {
+    icon = create_wifi_icon(parent, wifi_signal_level_from_rssi(status.rssi), false);
+  } else if (status.connecting) {
+    icon = create_wifi_icon(parent, 0, true);
+  } else {
+    icon = create_wifi_icon(parent, 0, false);
+  }
+
+  if (icon != NULL) {
+    lv_obj_center(icon);
+  }
+}
+
+static void update_home_wifi_icon(void)
+{
+  if (s_home_wifi_button == NULL) {
+    return;
+  }
+
+  lv_obj_clean(s_home_wifi_button);
+  create_current_wifi_icon(s_home_wifi_button);
+}
+
+static void home_wifi_timer_cb(lv_timer_t *timer)
+{
+  (void)timer;
+  update_home_wifi_icon();
+}
+
+static void stop_home_wifi_timer(void)
+{
+  if (s_home_wifi_timer != NULL) {
+    lv_timer_del(s_home_wifi_timer);
+    s_home_wifi_timer = NULL;
+  }
+  s_home_wifi_button = NULL;
+}
+
+static void wifi_status_changed_cb(void *user_ctx)
+{
+  (void)user_ctx;
+
+  lvgl_lock();
+  if (s_home_wifi_button != NULL) {
+    update_home_wifi_icon();
+  }
+  if (s_wifi_status_label != NULL || s_wifi_status_icon != NULL) {
+    update_wifi_status_text();
+  }
+  lvgl_unlock();
+}
+
 static lv_obj_t *create_list_row(lv_obj_t *parent,
                                  const char *text,
+                                 int signal_level,
                                  lv_coord_t width,
                                  lv_coord_t height,
                                  lv_event_cb_t cb,
@@ -294,11 +597,16 @@ static lv_obj_t *create_list_row(lv_obj_t *parent,
     lv_obj_add_event_cb(row, cb, LV_EVENT_CLICKED, user_data);
   }
 
+  lv_obj_t *icon = create_wifi_icon(row, signal_level, false);
+  if (icon != NULL) {
+    lv_obj_align(icon, LV_ALIGN_LEFT_MID, 0, 0);
+  }
+
   lv_obj_t *label = create_label(row, text, ui_font());
   if (label != NULL) {
-    lv_obj_set_width(label, width - 16);
+    lv_obj_set_width(label, width - 48);
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-    lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 34, 0);
   }
 
   return row;
@@ -311,6 +619,12 @@ static void clear_screen(void)
   lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
 }
 
+static void set_screen_bg(lv_color_t color)
+{
+  lv_obj_set_style_bg_color(lv_scr_act(), color, 0);
+  lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+}
+
 static void home_wifi_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -318,38 +632,22 @@ static void home_wifi_event_cb(lv_event_t *event)
   }
 }
 
-static void play_task(void *arg)
+static void update_home_volume_label(void)
 {
-  const char *url = (const char *)arg;
-  esp_err_t err = audio_play_test_tone();
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "play I2S test tone failed: %s", esp_err_to_name(err));
-  }
-  vTaskDelay(pdMS_TO_TICKS(250));
-
-  err = audio_play_mp3_url(url);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "play %s failed: %s", url, esp_err_to_name(err));
-  }
-  vTaskDelete(NULL);
-}
-
-static void home_play_event_cb(lv_event_t *event)
-{
-  if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
+  if (s_home_volume_label == NULL) {
     return;
   }
 
-  BaseType_t ret = xTaskCreate(play_task, "audio_play", 8192, (void *)LCD_PLAY_URL, 5, NULL);
-  if (ret != pdPASS) {
-    ESP_LOGE(TAG, "create audio play task failed");
-  }
+  char text[8];
+  snprintf(text, sizeof(text), "%d", audio_get_volume_level());
+  lv_label_set_text(s_home_volume_label, text);
 }
 
 static void home_volume_down_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
     audio_volume_down();
+    update_home_volume_label();
   }
 }
 
@@ -357,6 +655,7 @@ static void home_volume_up_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
     audio_volume_up();
+    update_home_volume_label();
   }
 }
 
@@ -407,6 +706,7 @@ static void textarea_event_cb(lv_event_t *event)
   if (s_keyboard != NULL) {
     lv_obj_set_size(s_keyboard, LCD_H_RES, 96);
     lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    setup_keyboard(s_keyboard);
     lv_keyboard_set_textarea(s_keyboard, s_password_ta);
   }
 }
@@ -499,6 +799,18 @@ static void update_wifi_status_text(void)
   }
 
   lv_label_set_text(s_wifi_status_label, text);
+  update_wifi_status_icon();
+}
+
+static void update_wifi_status_icon(void)
+{
+  if (s_wifi_status_icon == NULL) {
+    return;
+  }
+
+  lv_obj_clean(s_wifi_status_icon);
+
+  create_current_wifi_icon(s_wifi_status_icon);
 }
 
 static void show_scan_results_locked(void)
@@ -522,6 +834,7 @@ static void show_scan_results_locked(void)
              s_scan_results[i].rssi);
     lv_obj_t *row = create_list_row(s_wifi_list,
                                     row_text,
+                                    wifi_signal_level_from_rssi(s_scan_results[i].rssi),
                                     LCD_H_RES - 32,
                                     34,
                                     ssid_event_cb,
@@ -571,43 +884,108 @@ static void start_wifi_scan(void)
 
 static void show_home_page(void)
 {
+  stop_home_wifi_timer();
   close_keyboard();
   s_wifi_status_label = NULL;
+  s_wifi_status_icon = NULL;
   s_wifi_list = NULL;
   s_password_ta = NULL;
+  s_home_volume_label = NULL;
+  s_home_question_label = NULL;
+  s_home_reply_label = NULL;
 
   clear_screen();
+  set_screen_bg(lv_color_white());
 
-  lv_obj_t *title = create_label(lv_scr_act(), "ESP32 智能助手", ui_font());
-  if (title != NULL) {
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 36);
+  lv_obj_t *nav = lv_obj_create(lv_scr_act());
+  if (nav != NULL) {
+    lv_obj_set_size(nav, LCD_H_RES, 42);
+    lv_obj_align(nav, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_clear_flag(nav, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(nav, 0, 0);
+    lv_obj_set_style_border_side(nav, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(nav, 1, 0);
+    lv_obj_set_style_border_color(nav, lv_color_hex(0xe5e7eb), 0);
+    lv_obj_set_style_bg_color(nav, lv_color_white(), 0);
+    lv_obj_set_style_pad_all(nav, 0, 0);
+
+    lv_obj_t *title = create_label(nav, "ESP32 智能助手", ui_font());
+    if (title != NULL) {
+      lv_obj_align(title, LV_ALIGN_LEFT_MID, 12, 0);
+    }
+
+    s_home_wifi_button = lv_obj_create(nav);
+    if (s_home_wifi_button != NULL) {
+      lv_obj_set_size(s_home_wifi_button, 44, 34);
+      lv_obj_align(s_home_wifi_button, LV_ALIGN_RIGHT_MID, -8, 0);
+      lv_obj_add_flag(s_home_wifi_button, LV_OBJ_FLAG_CLICKABLE);
+      lv_obj_clear_flag(s_home_wifi_button, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_set_style_radius(s_home_wifi_button, 6, 0);
+      lv_obj_set_style_border_width(s_home_wifi_button, 0, 0);
+      lv_obj_set_style_bg_opa(s_home_wifi_button, LV_OPA_TRANSP, 0);
+      lv_obj_set_style_bg_color(s_home_wifi_button, lv_color_hex(0xe0f2fe), LV_STATE_PRESSED);
+      lv_obj_add_event_cb(s_home_wifi_button, home_wifi_event_cb, LV_EVENT_CLICKED, NULL);
+      update_home_wifi_icon();
+      s_home_wifi_timer = lv_timer_create(home_wifi_timer_cb, 30000, NULL);
+    }
   }
 
-  lv_obj_t *wifi_button = create_button(lv_scr_act(), "WiFi", 180, 58, home_wifi_event_cb, NULL);
-  if (wifi_button != NULL) {
-    lv_obj_align(wifi_button, LV_ALIGN_CENTER, 0, -18);
+  s_home_question_label = create_label(lv_scr_act(), s_home_question_text, ui_font());
+  if (s_home_question_label != NULL) {
+    lv_obj_set_width(s_home_question_label, LCD_H_RES - 32);
+    lv_obj_set_style_text_align(s_home_question_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_home_question_label, lv_color_hex(0x2563eb), 0);
+    lv_label_set_long_mode(s_home_question_label, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_home_question_label, LV_ALIGN_CENTER, 0, -32);
   }
 
-  lv_obj_t *volume_down_button = create_button(lv_scr_act(), "音量-", 58, 58, home_volume_down_event_cb, NULL);
-  if (volume_down_button != NULL) {
-    lv_obj_align(volume_down_button, LV_ALIGN_CENTER, -96, 52);
+  s_home_reply_label = create_label(lv_scr_act(), s_home_reply_text, ui_font());
+  if (s_home_reply_label != NULL) {
+    lv_obj_set_width(s_home_reply_label, LCD_H_RES - 32);
+    lv_obj_set_style_text_align(s_home_reply_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(s_home_reply_label,
+                                s_home_reply_thinking ? lv_color_hex(0x64748b) : lv_color_hex(0x16a34a),
+                                0);
+    lv_label_set_long_mode(s_home_reply_label, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_home_reply_label, LV_ALIGN_CENTER, 0, 22);
   }
 
-  lv_obj_t *play_button = create_button(lv_scr_act(), "播放", 104, 58, home_play_event_cb, NULL);
-  if (play_button != NULL) {
-    lv_obj_align(play_button, LV_ALIGN_CENTER, 0, 52);
-  }
+  lv_obj_t *volume_panel = lv_obj_create(lv_scr_act());
+  if (volume_panel != NULL) {
+    lv_obj_set_size(volume_panel, 128, 38);
+    lv_obj_align(volume_panel, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+    lv_obj_clear_flag(volume_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_radius(volume_panel, 0, 0);
+    lv_obj_set_style_border_width(volume_panel, 0, 0);
+    lv_obj_set_style_bg_opa(volume_panel, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(volume_panel, 0, 0);
 
-  lv_obj_t *volume_up_button = create_button(lv_scr_act(), "音量+", 58, 58, home_volume_up_event_cb, NULL);
-  if (volume_up_button != NULL) {
-    lv_obj_align(volume_up_button, LV_ALIGN_CENTER, 96, 52);
+    lv_obj_t *volume_down_button = create_button(volume_panel, "-", 38, 38, home_volume_down_event_cb, NULL);
+    if (volume_down_button != NULL) {
+      lv_obj_align(volume_down_button, LV_ALIGN_LEFT_MID, 0, 0);
+    }
+
+    s_home_volume_label = create_label(volume_panel, "", ui_font());
+    if (s_home_volume_label != NULL) {
+      lv_obj_set_width(s_home_volume_label, 44);
+      lv_obj_set_style_text_align(s_home_volume_label, LV_TEXT_ALIGN_CENTER, 0);
+      lv_obj_align(s_home_volume_label, LV_ALIGN_CENTER, 0, 0);
+      update_home_volume_label();
+    }
+
+    lv_obj_t *volume_up_button = create_button(volume_panel, "+", 38, 38, home_volume_up_event_cb, NULL);
+    if (volume_up_button != NULL) {
+      lv_obj_align(volume_up_button, LV_ALIGN_RIGHT_MID, 0, 0);
+    }
   }
 }
 
 static void show_wifi_connect_page(const char *ssid)
 {
+  stop_home_wifi_timer();
   close_keyboard();
   s_wifi_status_label = NULL;
+  s_wifi_status_icon = NULL;
   s_wifi_list = NULL;
   s_password_ta = NULL;
 
@@ -644,8 +1022,11 @@ static void show_wifi_connect_page(const char *ssid)
 
   s_password_ta = lv_textarea_create(lv_scr_act());
   if (s_password_ta != NULL) {
-    lv_obj_set_size(s_password_ta, LCD_H_RES - 24, 38);
-    lv_obj_align(s_password_ta, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_size(s_password_ta, LCD_H_RES - 24, 34);
+    lv_obj_align(s_password_ta, LV_ALIGN_TOP_MID, 0, 76);
+    lv_obj_set_style_text_font(s_password_ta, ui_font(), 0);
+    lv_obj_set_style_text_font(s_password_ta, ui_font(), LV_PART_TEXTAREA_PLACEHOLDER);
+    lv_obj_set_style_text_color(s_password_ta, lv_color_hex(0x64748b), LV_PART_TEXTAREA_PLACEHOLDER);
     lv_textarea_set_one_line(s_password_ta, true);
     lv_textarea_set_password_mode(s_password_ta, false);
     lv_textarea_set_placeholder_text(s_password_ta, "请输入密码");
@@ -653,16 +1034,17 @@ static void show_wifi_connect_page(const char *ssid)
     lv_obj_add_state(s_password_ta, LV_STATE_FOCUSED);
   }
 
-  lv_obj_t *connect = create_button(lv_scr_act(), "连接", LCD_H_RES - 24, 34, connect_event_cb, NULL);
+  lv_obj_t *connect = create_button(lv_scr_act(), "连接", LCD_H_RES - 24, 28, connect_event_cb, NULL);
   if (connect != NULL) {
-    lv_obj_align(connect, LV_ALIGN_TOP_MID, 0, 122);
+    lv_obj_align(connect, LV_ALIGN_TOP_MID, 0, 114);
   }
 
   if (s_password_ta != NULL) {
     s_keyboard = lv_keyboard_create(lv_scr_act());
     if (s_keyboard != NULL) {
-      lv_obj_set_size(s_keyboard, LCD_H_RES, 78);
+      lv_obj_set_size(s_keyboard, LCD_H_RES, 96);
       lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+      setup_keyboard(s_keyboard);
       lv_keyboard_set_textarea(s_keyboard, s_password_ta);
     }
   }
@@ -670,6 +1052,7 @@ static void show_wifi_connect_page(const char *ssid)
 
 static void show_wifi_page(void)
 {
+  stop_home_wifi_timer();
   close_keyboard();
   s_password_ta = NULL;
   clear_screen();
@@ -700,10 +1083,20 @@ static void show_wifi_page(void)
   }
 
   s_wifi_status_label = create_label(lv_scr_act(), "", ui_font());
+  s_wifi_status_icon = lv_obj_create(lv_scr_act());
+  if (s_wifi_status_icon != NULL) {
+    lv_obj_set_size(s_wifi_status_icon, 36, 28);
+    lv_obj_align(s_wifi_status_icon, LV_ALIGN_TOP_LEFT, 10, 54);
+    lv_obj_clear_flag(s_wifi_status_icon, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_border_width(s_wifi_status_icon, 0, 0);
+    lv_obj_set_style_radius(s_wifi_status_icon, 0, 0);
+    lv_obj_set_style_pad_all(s_wifi_status_icon, 0, 0);
+    lv_obj_set_style_bg_opa(s_wifi_status_icon, LV_OPA_TRANSP, 0);
+  }
   if (s_wifi_status_label != NULL) {
-    lv_obj_set_width(s_wifi_status_label, LCD_H_RES - 24);
+    lv_obj_set_width(s_wifi_status_label, LCD_H_RES - 58);
     lv_label_set_long_mode(s_wifi_status_label, LV_LABEL_LONG_WRAP);
-    lv_obj_align(s_wifi_status_label, LV_ALIGN_TOP_LEFT, 12, 52);
+    lv_obj_align(s_wifi_status_label, LV_ALIGN_TOP_LEFT, 50, 52);
   }
   update_wifi_status_text();
 
@@ -939,8 +1332,11 @@ esp_err_t lcd_init(void)
   ESP_RETURN_ON_ERROR(lcd_backlight_init(), TAG, "backlight init failed");
   ESP_RETURN_ON_ERROR(lcd_panel_init(), TAG, "panel init failed");
   ESP_RETURN_ON_ERROR(lvgl_port_init(), TAG, "LVGL init failed");
+  audio_set_pcm_playback_text_cb(lcd_show_text);
+  app_wifi_set_status_changed_cb(wifi_status_changed_cb, NULL);
   ESP_RETURN_ON_ERROR(app_wifi_init(), TAG, "WiFi init failed");
 
+  s_lcd_ready = true;
   lvgl_lock();
   show_home_page();
   lv_obj_invalidate(lv_scr_act());
@@ -951,9 +1347,63 @@ esp_err_t lcd_init(void)
 
 void lcd_show_text(const char *text)
 {
-  (void)text;
+  if (!s_lcd_ready) {
+    return;
+  }
+
+  strlcpy(s_home_reply_text, text != NULL ? text : "", sizeof(s_home_reply_text));
+  s_home_reply_thinking = false;
 
   lvgl_lock();
   show_home_page();
+  if (s_home_reply_label != NULL) {
+    lv_label_set_text(s_home_reply_label, s_home_reply_text);
+    lv_obj_set_style_text_color(s_home_reply_label, lv_color_hex(0x16a34a), 0);
+  }
+  lvgl_unlock();
+}
+
+void lcd_show_user_speaking(void)
+{
+  if (!s_lcd_ready) {
+    return;
+  }
+
+  strlcpy(s_home_question_text, "正在说话", sizeof(s_home_question_text));
+  s_home_reply_text[0] = '\0';
+  s_home_reply_thinking = false;
+
+  lvgl_lock();
+  show_home_page();
+  if (s_home_question_label != NULL) {
+    lv_label_set_text(s_home_question_label, s_home_question_text);
+    lv_obj_set_style_text_color(s_home_question_label, lv_color_hex(0x2563eb), 0);
+  }
+  if (s_home_reply_label != NULL) {
+    lv_label_set_text(s_home_reply_label, s_home_reply_text);
+  }
+  lvgl_unlock();
+}
+
+void lcd_show_user_question(const char *text)
+{
+  if (!s_lcd_ready) {
+    return;
+  }
+
+  strlcpy(s_home_question_text, text != NULL ? text : "", sizeof(s_home_question_text));
+  strlcpy(s_home_reply_text, "思考中", sizeof(s_home_reply_text));
+  s_home_reply_thinking = true;
+
+  lvgl_lock();
+  show_home_page();
+  if (s_home_question_label != NULL) {
+    lv_label_set_text(s_home_question_label, s_home_question_text);
+    lv_obj_set_style_text_color(s_home_question_label, lv_color_hex(0x2563eb), 0);
+  }
+  if (s_home_reply_label != NULL) {
+    lv_label_set_text(s_home_reply_label, s_home_reply_text);
+    lv_obj_set_style_text_color(s_home_reply_label, lv_color_hex(0x64748b), 0);
+  }
   lvgl_unlock();
 }

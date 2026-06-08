@@ -11,6 +11,8 @@
 extern "C" {
 #endif
 
+typedef void (*audio_pcm_playback_text_cb_t)(const char *text);
+
 // MAX98357A I2S pins. These GPIOs are currently unused by LCD, touch, key, LED,
 // USB, and boot strapping in this project.
 #define AUDIO_I2S_PIN_BCLK GPIO_NUM_4
@@ -27,9 +29,15 @@ esp_err_t audio_queue_pcm_s16le(const void *pcm,
                                 size_t bytes,
                                 uint32_t sample_rate_hz,
                                 int channels);
+esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
+                                          size_t bytes,
+                                          uint32_t sample_rate_hz,
+                                          int channels,
+                                          const char *text);
+void audio_set_pcm_playback_text_cb(audio_pcm_playback_text_cb_t cb);
 int audio_volume_up(void);
 int audio_volume_down(void);
-int audio_get_volume_percent(void);
+int audio_get_volume_level(void);
 
 #ifdef __cplusplus
 }

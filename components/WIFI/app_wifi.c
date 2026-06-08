@@ -34,8 +34,11 @@ static bool s_pending_save;
 static bool s_suppress_next_disconnect_retry;
 static uint8_t s_retry_count;
 static TaskHandle_t s_retry_task_handle;
+static app_wifi_status_changed_cb_t s_status_changed_cb;
+static void *s_status_changed_user_ctx;
 
 static void schedule_retry(void);
+static void notify_status_changed(void);
 
 static void status_lock(void)
 {
@@ -48,6 +51,14 @@ static void status_unlock(void)
 {
   if (s_status_mutex != NULL) {
     xSemaphoreGive(s_status_mutex);
+  }
+}
+
+static void notify_status_changed(void)
+{
+  app_wifi_status_changed_cb_t cb = s_status_changed_cb;
+  if (cb != NULL) {
+    cb(s_status_changed_user_ctx);
   }
 }
 
@@ -134,9 +145,11 @@ static esp_err_t connect_with_credentials(const char *ssid,
   status_lock();
   s_status.connected = false;
   s_status.connecting = true;
+  s_status.rssi = -127;
   strlcpy(s_status.ssid, ssid, sizeof(s_status.ssid));
   memset(&s_status.ip_info, 0, sizeof(s_status.ip_info));
   status_unlock();
+  notify_status_changed();
 
   if (save_on_success) {
     strlcpy(s_pending_ssid, ssid, sizeof(s_pending_ssid));
@@ -216,8 +229,10 @@ static void wifi_event_handler(void *arg,
     status_lock();
     s_status.connected = false;
     s_status.connecting = false;
+    s_status.rssi = -127;
     memset(&s_status.ip_info, 0, sizeof(s_status.ip_info));
     status_unlock();
+    notify_status_changed();
 
     wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
     ESP_LOGW(TAG, "WiFi disconnected, reason=%d", event != NULL ? event->reason : -1);
@@ -233,10 +248,12 @@ static void wifi_event_handler(void *arg,
     status_lock();
     s_status.connected = true;
     s_status.connecting = false;
+    s_status.rssi = -127;
     if (event != NULL) {
       s_status.ip_info = event->ip_info;
     }
     status_unlock();
+    notify_status_changed();
 
     ESP_LOGI(TAG, "got IP: " IPSTR, IP2STR(&event->ip_info.ip));
     s_suppress_next_disconnect_retry = false;
@@ -363,4 +380,19 @@ void app_wifi_get_status(app_wifi_status_t *status)
   status_lock();
   *status = s_status;
   status_unlock();
+
+  if (status->connected) {
+    wifi_ap_record_t ap_info = {0};
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+      status->rssi = ap_info.rssi;
+    } else {
+      status->rssi = -127;
+    }
+  }
+}
+
+void app_wifi_set_status_changed_cb(app_wifi_status_changed_cb_t cb, void *user_ctx)
+{
+  s_status_changed_cb = cb;
+  s_status_changed_user_ctx = user_ctx;
 }

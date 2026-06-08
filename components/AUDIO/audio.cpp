@@ -14,8 +14,13 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "micro_mp3/mp3_decoder.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 static const char *TAG = "audio";
+
+#define AUDIO_NVS_NAMESPACE "audio"
+#define AUDIO_NVS_KEY_VOLUME "volume"
 
 static i2s_chan_handle_t s_i2s_tx_chan;
 static SemaphoreHandle_t s_audio_mutex;
@@ -23,12 +28,14 @@ static QueueHandle_t s_pcm_queue;
 static TaskHandle_t s_pcm_play_task_handle;
 static uint32_t s_current_sample_rate;
 static bool s_i2s_enabled;
-static volatile int s_volume_percent = 100;
+static volatile int s_volume_level = 6;
+static audio_pcm_playback_text_cb_t s_pcm_playback_text_cb;
 
 enum {
-  audio_volume_min_percent = 10,
-  audio_volume_max_percent = 200,
-  audio_volume_step_percent = 10,
+  audio_volume_min_level = 0,
+  audio_volume_max_level = 10,
+  audio_volume_default_level = 6,
+  audio_volume_percent_per_level = 20,
   audio_pcm_queue_depth = 16,
   audio_pcm_play_task_stack = 6144,
   audio_pcm_play_task_priority = 5,
@@ -36,10 +43,109 @@ enum {
 
 typedef struct {
   uint8_t *data;
+  char *text;
   size_t bytes;
   uint32_t sample_rate_hz;
   int channels;
 } audio_pcm_queue_item_t;
+
+static char *audio_strdup(const char *text)
+{
+  if (text == nullptr || text[0] == '\0') {
+    return nullptr;
+  }
+
+  size_t len = strlen(text);
+  char *copy = (char *)malloc(len + 1);
+  if (copy != nullptr) {
+    memcpy(copy, text, len + 1);
+  }
+  return copy;
+}
+
+static int audio_clamp_volume_level(int volume_level)
+{
+  if (volume_level < audio_volume_min_level) {
+    return audio_volume_min_level;
+  }
+  if (volume_level > audio_volume_max_level) {
+    return audio_volume_max_level;
+  }
+  return volume_level;
+}
+
+static int audio_level_to_percent(int volume_level)
+{
+  return audio_clamp_volume_level(volume_level) * audio_volume_percent_per_level;
+}
+
+static esp_err_t audio_init_nvs(void)
+{
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase NVS failed");
+    err = nvs_flash_init();
+  }
+  return err;
+}
+
+static void audio_load_volume_level(void)
+{
+  esp_err_t err = audio_init_nvs();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "init NVS for volume failed: %s", esp_err_to_name(err));
+    s_volume_level = audio_volume_default_level;
+    return;
+  }
+
+  nvs_handle_t nvs_handle;
+  err = nvs_open(AUDIO_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+    s_volume_level = audio_volume_default_level;
+    ESP_LOGI(TAG, "no saved volume, use default: %d", s_volume_level);
+    return;
+  }
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "open volume NVS failed: %s", esp_err_to_name(err));
+    s_volume_level = audio_volume_default_level;
+    return;
+  }
+
+  int32_t saved_level = audio_volume_default_level;
+  err = nvs_get_i32(nvs_handle, AUDIO_NVS_KEY_VOLUME, &saved_level);
+  nvs_close(nvs_handle);
+
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+    s_volume_level = audio_volume_default_level;
+  } else if (err == ESP_OK) {
+    s_volume_level = audio_clamp_volume_level(saved_level);
+  } else {
+    ESP_LOGW(TAG, "read saved volume failed: %s", esp_err_to_name(err));
+    s_volume_level = audio_volume_default_level;
+  }
+
+  ESP_LOGI(TAG, "volume level loaded: %d", s_volume_level);
+}
+
+static void audio_save_volume_level(int volume_level)
+{
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open(AUDIO_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "open volume NVS for write failed: %s", esp_err_to_name(err));
+    return;
+  }
+
+  err = nvs_set_i32(nvs_handle, AUDIO_NVS_KEY_VOLUME, audio_clamp_volume_level(volume_level));
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs_handle);
+  }
+  nvs_close(nvs_handle);
+
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "save volume failed: %s", esp_err_to_name(err));
+  }
+}
 
 static int16_t audio_abs_i16(int16_t value)
 {
@@ -63,7 +169,7 @@ static int16_t audio_pcm_peak(const int16_t *pcm, size_t sample_count)
 
 static void audio_apply_gain(int16_t *pcm, size_t sample_count)
 {
-  int volume_percent = audio_get_volume_percent();
+  int volume_percent = audio_level_to_percent(s_volume_level);
   if (volume_percent == 100) {
     return;
   }
@@ -92,13 +198,13 @@ static void audio_log_pcm_stats(const char *prefix,
 {
   size_t pcm_value_count = samples_per_channel * (channels > 1 ? 2 : 1);
   ESP_LOGI(TAG,
-           "%s frame=%u samples/ch=%u channels=%d peak=%d volume=%d%% peak_out=%d first=[%d,%d,%d,%d] i2s=%u bytes buffered=%u downloaded=%u",
+           "%s frame=%u samples/ch=%u channels=%d peak=%d volume=%d/10 peak_out=%d first=[%d,%d,%d,%d] i2s=%u bytes buffered=%u downloaded=%u",
            prefix,
            (unsigned)frame,
            (unsigned)samples_per_channel,
            channels,
            peak_before_gain,
-           audio_get_volume_percent(),
+           audio_get_volume_level(),
            peak_after_gain,
            pcm_value_count > 0 ? pcm[0] : 0,
            pcm_value_count > 1 ? pcm[1] : 0,
@@ -224,16 +330,22 @@ static void audio_pcm_play_task(void *arg)
 
     if (item.data == nullptr || item.bytes == 0) {
       free(item.data);
+      free(item.text);
       continue;
     }
 
     if (xSemaphoreTake(s_audio_mutex, portMAX_DELAY) != pdTRUE) {
       free(item.data);
+      free(item.text);
       continue;
     }
 
     esp_err_t ret = audio_configure_i2s(item.sample_rate_hz);
     if (ret == ESP_OK) {
+      if (s_pcm_playback_text_cb != nullptr && item.text != nullptr && item.text[0] != '\0') {
+        s_pcm_playback_text_cb(item.text);
+      }
+
       size_t sample_count = item.bytes / sizeof(int16_t);
       int16_t *pcm = (int16_t *)item.data;
       int16_t peak_before_gain = audio_pcm_peak(pcm, sample_count);
@@ -247,11 +359,11 @@ static void audio_pcm_play_task(void *arg)
         ESP_LOGE(TAG, "write queued PCM failed: %s", esp_err_to_name(ret));
       } else if (bytes_written > 0) {
         ESP_LOGI(TAG,
-                 "queued PCM played: %u bytes, %lu Hz, channels=%d, volume=%d%%, peak=%d, peak_out=%d, i2s=%u",
+                 "queued PCM played: %u bytes, %lu Hz, channels=%d, volume=%d/10, peak=%d, peak_out=%d, i2s=%u",
                  (unsigned)item.bytes,
                  (unsigned long)item.sample_rate_hz,
                  item.channels,
-                 audio_get_volume_percent(),
+                 audio_get_volume_level(),
                  peak_before_gain,
                  peak_after_gain,
                  (unsigned)bytes_written);
@@ -265,6 +377,7 @@ static void audio_pcm_play_task(void *arg)
 
     xSemaphoreGive(s_audio_mutex);
     free(item.data);
+    free(item.text);
   }
 }
 
@@ -273,6 +386,8 @@ extern "C" esp_err_t audio_init(void)
   if (s_i2s_tx_chan != nullptr) {
     return ESP_OK;
   }
+
+  audio_load_volume_level();
 
   s_audio_mutex = xSemaphoreCreateMutex();
   ESP_RETURN_ON_FALSE(s_audio_mutex != nullptr, ESP_ERR_NO_MEM, TAG, "create audio mutex failed");
@@ -320,10 +435,11 @@ extern "C" esp_err_t audio_init(void)
   ESP_RETURN_ON_FALSE(task_ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create PCM playback task failed");
 
   ESP_LOGI(TAG,
-           "MAX98357A I2S ready: BCLK=%d LRCLK=%d DIN=%d",
+           "MAX98357A I2S ready: BCLK=%d LRCLK=%d DIN=%d volume=%d/10",
            AUDIO_I2S_PIN_BCLK,
            AUDIO_I2S_PIN_LRCLK,
-           AUDIO_I2S_PIN_DIN);
+           AUDIO_I2S_PIN_DIN,
+           audio_get_volume_level());
   return ESP_OK;
 }
 
@@ -331,6 +447,15 @@ extern "C" esp_err_t audio_queue_pcm_s16le(const void *pcm,
                                            size_t bytes,
                                            uint32_t sample_rate_hz,
                                            int channels)
+{
+  return audio_queue_pcm_s16le_with_text(pcm, bytes, sample_rate_hz, channels, nullptr);
+}
+
+extern "C" esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
+                                                     size_t bytes,
+                                                     uint32_t sample_rate_hz,
+                                                     int channels,
+                                                     const char *text)
 {
   ESP_RETURN_ON_ERROR(audio_init(), TAG, "audio init failed");
   ESP_RETURN_ON_FALSE(pcm != nullptr && bytes > 0, ESP_ERR_INVALID_ARG, TAG, "empty PCM");
@@ -348,8 +473,16 @@ extern "C" esp_err_t audio_queue_pcm_s16le(const void *pcm,
   ESP_RETURN_ON_FALSE(copy != nullptr, ESP_ERR_NO_MEM, TAG, "copy queued PCM failed");
   memcpy(copy, pcm, bytes);
 
+  char *text_copy = audio_strdup(text);
+  if (text != nullptr && text[0] != '\0' && text_copy == nullptr) {
+    free(copy);
+    ESP_LOGW(TAG, "copy queued PCM text failed");
+    return ESP_ERR_NO_MEM;
+  }
+
   audio_pcm_queue_item_t item = {
     .data = copy,
+    .text = text_copy,
     .bytes = bytes,
     .sample_rate_hz = sample_rate_hz,
     .channels = channels,
@@ -357,6 +490,7 @@ extern "C" esp_err_t audio_queue_pcm_s16le(const void *pcm,
 
   if (xQueueSend(s_pcm_queue, &item, portMAX_DELAY) != pdTRUE) {
     free(copy);
+    free(text_copy);
     ESP_LOGW(TAG, "PCM playback queue is full");
     return ESP_ERR_TIMEOUT;
   }
@@ -364,34 +498,30 @@ extern "C" esp_err_t audio_queue_pcm_s16le(const void *pcm,
   return ESP_OK;
 }
 
-static int audio_clamp_volume_percent(int volume_percent)
+extern "C" void audio_set_pcm_playback_text_cb(audio_pcm_playback_text_cb_t cb)
 {
-  if (volume_percent < audio_volume_min_percent) {
-    return audio_volume_min_percent;
-  }
-  if (volume_percent > audio_volume_max_percent) {
-    return audio_volume_max_percent;
-  }
-  return volume_percent;
+  s_pcm_playback_text_cb = cb;
 }
 
-extern "C" int audio_get_volume_percent(void)
+extern "C" int audio_get_volume_level(void)
 {
-  return s_volume_percent;
+  return s_volume_level;
 }
 
 extern "C" int audio_volume_up(void)
 {
-  s_volume_percent = audio_clamp_volume_percent(s_volume_percent + audio_volume_step_percent);
-  ESP_LOGI(TAG, "volume up: %d%%", s_volume_percent);
-  return s_volume_percent;
+  s_volume_level = audio_clamp_volume_level(s_volume_level + 1);
+  audio_save_volume_level(s_volume_level);
+  ESP_LOGI(TAG, "volume up: %d/10", s_volume_level);
+  return s_volume_level;
 }
 
 extern "C" int audio_volume_down(void)
 {
-  s_volume_percent = audio_clamp_volume_percent(s_volume_percent - audio_volume_step_percent);
-  ESP_LOGI(TAG, "volume down: %d%%", s_volume_percent);
-  return s_volume_percent;
+  s_volume_level = audio_clamp_volume_level(s_volume_level - 1);
+  audio_save_volume_level(s_volume_level);
+  ESP_LOGI(TAG, "volume down: %d/10", s_volume_level);
+  return s_volume_level;
 }
 
 extern "C" esp_err_t audio_play_test_tone(void)
