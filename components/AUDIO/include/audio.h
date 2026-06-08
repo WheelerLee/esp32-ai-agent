@@ -1,6 +1,9 @@
 #ifndef AUDIO_H
 #define AUDIO_H
 
+#include <stddef.h>
+#include <stdint.h>
+
 #include "driver/gpio.h"
 #include "esp_err.h"
 
@@ -20,6 +23,10 @@ extern "C" {
 esp_err_t audio_init(void);
 esp_err_t audio_play_test_tone(void);
 esp_err_t audio_play_mp3_url(const char *url);
+esp_err_t audio_queue_pcm_s16le(const void *pcm,
+                                size_t bytes,
+                                uint32_t sample_rate_hz,
+                                int channels);
 int audio_volume_up(void);
 int audio_volume_down(void);
 int audio_get_volume_percent(void);

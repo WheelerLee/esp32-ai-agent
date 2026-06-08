@@ -2,6 +2,7 @@
 # Name, Type, SubType, Offset, Size, Flags
 nvs,data,nvs,0x9000,0x6000,,
 phy_init,data,phy,0xf000,0x1000,,
-factory,app,factory,0x10000,0x1F0000,,
-vfs,data,fat,0x200000,0xA00000,,
-storage,data,spiffs,0xc00000,0x400000,,
+factory,app,factory,0x10000,0x400000,,
+vfs,data,fat,0x410000,0x800000,,
+font,data,spiffs,0xc10000,0x80000,,
+storage,data,spiffs,0xc90000,0x370000,,

@@ -17,6 +17,7 @@
 #include "esp_lcd_touch.h"
 #include "esp_lcd_touch_xpt2046.h"
 #include "esp_log.h"
+#include "esp_spiffs.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -38,6 +39,9 @@ static lv_obj_t *s_keyboard;
 static esp_lcd_touch_handle_t s_touch_handle;
 static SemaphoreHandle_t s_lvgl_mutex;
 static TaskHandle_t s_lvgl_task_handle;
+static lv_font_t *s_external_chinese_font;
+static bool s_font_fs_ready;
+static uint32_t s_font_fs_io_count;
 static app_wifi_ap_record_t s_scan_results[APP_WIFI_MAX_APS];
 static size_t s_scan_count;
 static char s_selected_ssid[APP_WIFI_SSID_MAX_LEN + 1];
@@ -47,8 +51,187 @@ static void show_wifi_page(void);
 static void show_wifi_connect_page(const char *ssid);
 static void start_wifi_scan(void);
 static void update_wifi_status_text(void);
+static void lvgl_lock(void);
+static void lvgl_unlock(void);
 
-#define LCD_PLAY_URL "http://192.168.1.112:5500/music.mp3"
+#define LCD_PLAY_URL "http://192.168.1.254:5500/music.mp3"
+#define LCD_FONT_MOUNT_POINT "/font"
+#define LCD_FONT_PARTITION_LABEL "font"
+#define LCD_FONT_FILE_NAME "llm_text_14.bin"
+#define LCD_FONT_LVGL_PATH "F:/" LCD_FONT_FILE_NAME
+#define LCD_FONT_FS_YIELD_INTERVAL 64
+
+static const lv_font_t *ui_font(void)
+{
+  return s_external_chinese_font != NULL ? s_external_chinese_font : &lv_font_chinese_16;
+}
+
+static bool font_fs_ready_cb(lv_fs_drv_t *drv)
+{
+  (void)drv;
+  return s_font_fs_ready;
+}
+
+static void *font_fs_open_cb(lv_fs_drv_t *drv, const char *path, lv_fs_mode_t mode)
+{
+  (void)drv;
+
+  if ((mode & LV_FS_MODE_WR) != 0 || path == NULL) {
+    return NULL;
+  }
+
+  char full_path[128];
+  int written = snprintf(full_path,
+                         sizeof(full_path),
+                         "%s%s%s",
+                         LCD_FONT_MOUNT_POINT,
+                         path[0] == '/' ? "" : "/",
+                         path);
+  if (written < 0 || written >= (int)sizeof(full_path)) {
+    return NULL;
+  }
+
+  return fopen(full_path, "rb");
+}
+
+static void font_fs_yield(void)
+{
+  if (++s_font_fs_io_count >= LCD_FONT_FS_YIELD_INTERVAL) {
+    s_font_fs_io_count = 0;
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+static lv_fs_res_t font_fs_close_cb(lv_fs_drv_t *drv, void *file_p)
+{
+  (void)drv;
+  return fclose((FILE *)file_p) == 0 ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
+}
+
+static lv_fs_res_t font_fs_read_cb(lv_fs_drv_t *drv, void *file_p, void *buf, uint32_t btr, uint32_t *br)
+{
+  (void)drv;
+
+  size_t read_count = fread(buf, 1, btr, (FILE *)file_p);
+  if (br != NULL) {
+    *br = read_count;
+  }
+  font_fs_yield();
+  return ferror((FILE *)file_p) == 0 ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
+}
+
+static lv_fs_res_t font_fs_seek_cb(lv_fs_drv_t *drv, void *file_p, uint32_t pos, lv_fs_whence_t whence)
+{
+  (void)drv;
+
+  int origin = SEEK_SET;
+  if (whence == LV_FS_SEEK_CUR) {
+    origin = SEEK_CUR;
+  } else if (whence == LV_FS_SEEK_END) {
+    origin = SEEK_END;
+  }
+
+  int ret = fseek((FILE *)file_p, (long)pos, origin);
+  font_fs_yield();
+  return ret == 0 ? LV_FS_RES_OK : LV_FS_RES_UNKNOWN;
+}
+
+static lv_fs_res_t font_fs_tell_cb(lv_fs_drv_t *drv, void *file_p, uint32_t *pos_p)
+{
+  (void)drv;
+
+  long pos = ftell((FILE *)file_p);
+  if (pos < 0) {
+    return LV_FS_RES_UNKNOWN;
+  }
+  if (pos_p != NULL) {
+    *pos_p = (uint32_t)pos;
+  }
+  return LV_FS_RES_OK;
+}
+
+static bool is_lvgl_bin_font_file(void)
+{
+  char full_path[128];
+  int written = snprintf(full_path, sizeof(full_path), "%s/%s", LCD_FONT_MOUNT_POINT, LCD_FONT_FILE_NAME);
+  if (written < 0 || written >= (int)sizeof(full_path)) {
+    return false;
+  }
+
+  FILE *file = fopen(full_path, "rb");
+  if (file == NULL) {
+    return false;
+  }
+
+  uint8_t header[8] = {0};
+  size_t read_count = fread(header, 1, sizeof(header), file);
+  fclose(file);
+
+  return read_count == sizeof(header) && header[0] == 0x30 && memcmp(&header[4], "head", 4) == 0;
+}
+
+static void register_font_lvgl_fs(void)
+{
+  static bool s_registered;
+  static lv_fs_drv_t s_font_drv;
+
+  if (s_registered) {
+    return;
+  }
+
+  lv_fs_drv_init(&s_font_drv);
+  s_font_drv.letter = 'F';
+  s_font_drv.ready_cb = font_fs_ready_cb;
+  s_font_drv.open_cb = font_fs_open_cb;
+  s_font_drv.close_cb = font_fs_close_cb;
+  s_font_drv.read_cb = font_fs_read_cb;
+  s_font_drv.seek_cb = font_fs_seek_cb;
+  s_font_drv.tell_cb = font_fs_tell_cb;
+  lv_fs_drv_register(&s_font_drv);
+  s_registered = true;
+}
+
+static void load_external_font(void)
+{
+  esp_vfs_spiffs_conf_t conf = {
+    .base_path = LCD_FONT_MOUNT_POINT,
+    .partition_label = LCD_FONT_PARTITION_LABEL,
+    .max_files = 2,
+    .format_if_mount_failed = false,
+  };
+
+  esp_err_t err = esp_vfs_spiffs_register(&conf);
+  if (err == ESP_ERR_INVALID_STATE) {
+    err = ESP_OK;
+  }
+
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "mount font partition failed: %s", esp_err_to_name(err));
+    return;
+  }
+
+  s_font_fs_ready = true;
+  register_font_lvgl_fs();
+
+  int64_t start_us = esp_timer_get_time();
+  if (!is_lvgl_bin_font_file()) {
+    ESP_LOGW(TAG,
+             "unsupported LVGL font file format: %s, checked in %lld ms",
+             LCD_FONT_LVGL_PATH,
+             (long long)((esp_timer_get_time() - start_us) / 1000));
+    return;
+  }
+
+  s_external_chinese_font = lv_font_load(LCD_FONT_LVGL_PATH);
+  if (s_external_chinese_font == NULL) {
+    ESP_LOGW(TAG, "load external font failed: %s", LCD_FONT_LVGL_PATH);
+  } else {
+    ESP_LOGI(TAG,
+             "loaded external font: %s in %lld ms",
+             LCD_FONT_LVGL_PATH,
+             (long long)((esp_timer_get_time() - start_us) / 1000));
+  }
+}
 
 static uint16_t clamp_u16(uint16_t value, uint16_t min_value, uint16_t max_value)
 {
@@ -214,7 +397,7 @@ static lv_obj_t *create_button(lv_obj_t *parent,
     lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, user_data);
   }
 
-  lv_obj_t *label = create_label(button, text, &lv_font_chinese_16);
+  lv_obj_t *label = create_label(button, text, ui_font());
   if (label != NULL) {
     lv_obj_set_style_text_color(label, lv_color_white(), 0);
     lv_obj_center(label);
@@ -249,7 +432,7 @@ static lv_obj_t *create_list_row(lv_obj_t *parent,
     lv_obj_add_event_cb(row, cb, LV_EVENT_CLICKED, user_data);
   }
 
-  lv_obj_t *label = create_label(row, text, &lv_font_chinese_16);
+  lv_obj_t *label = create_label(row, text, ui_font());
   if (label != NULL) {
     lv_obj_set_width(label, width - 16);
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
@@ -443,14 +626,14 @@ static void update_wifi_status_text(void)
   if (status.connected) {
     snprintf(text,
              sizeof(text),
-             "Connected\nSSID: %s\nIP: " IPSTR "\nGW: " IPSTR,
+             "已连接\n网络: %s\nIP: " IPSTR "\n网关: " IPSTR,
              status.ssid,
              IP2STR(&status.ip_info.ip),
              IP2STR(&status.ip_info.gw));
   } else if (status.connecting) {
-    snprintf(text, sizeof(text), "Connecting\nSSID: %s", status.ssid);
+    snprintf(text, sizeof(text), "正在连接\n网络: %s", status.ssid);
   } else {
-    snprintf(text, sizeof(text), "Not connected\nScan WiFi networks below");
+    snprintf(text, sizeof(text), "未连接\n请扫描并选择 WiFi");
   }
 
   lv_label_set_text(s_wifi_status_label, text);
@@ -464,7 +647,7 @@ static void show_scan_results_locked(void)
 
   lv_obj_clean(s_wifi_list);
   if (s_scan_count == 0) {
-    create_label(s_wifi_list, "No WiFi found", &lv_font_chinese_16);
+    create_label(s_wifi_list, "未发现 WiFi", ui_font());
     return;
   }
 
@@ -473,7 +656,7 @@ static void show_scan_results_locked(void)
     snprintf(row_text,
              sizeof(row_text),
              "%s  %d dBm",
-             s_scan_results[i].ssid[0] != '\0' ? s_scan_results[i].ssid : "<hidden>",
+             s_scan_results[i].ssid[0] != '\0' ? s_scan_results[i].ssid : "<隐藏>",
              s_scan_results[i].rssi);
     lv_obj_t *row = create_list_row(s_wifi_list,
                                     row_text,
@@ -515,7 +698,7 @@ static void start_wifi_scan(void)
 
   if (s_wifi_list != NULL) {
     lv_obj_clean(s_wifi_list);
-    create_label(s_wifi_list, "Scanning...", &lv_font_chinese_16);
+    create_label(s_wifi_list, "正在扫描...", ui_font());
   }
 
   BaseType_t ret = xTaskCreate(scan_task, "wifi_scan", 4096, NULL, 4, NULL);
@@ -533,7 +716,7 @@ static void show_home_page(void)
 
   clear_screen();
 
-  lv_obj_t *title = create_label(lv_scr_act(), "esp32 demo", &lv_font_chinese_16);
+  lv_obj_t *title = create_label(lv_scr_act(), "ESP32 智能助手", ui_font());
   if (title != NULL) {
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 36);
   }
@@ -543,17 +726,17 @@ static void show_home_page(void)
     lv_obj_align(wifi_button, LV_ALIGN_CENTER, 0, -18);
   }
 
-  lv_obj_t *volume_down_button = create_button(lv_scr_act(), "Vol-", 58, 58, home_volume_down_event_cb, NULL);
+  lv_obj_t *volume_down_button = create_button(lv_scr_act(), "音量-", 58, 58, home_volume_down_event_cb, NULL);
   if (volume_down_button != NULL) {
     lv_obj_align(volume_down_button, LV_ALIGN_CENTER, -96, 52);
   }
 
-  lv_obj_t *play_button = create_button(lv_scr_act(), "Play", 104, 58, home_play_event_cb, NULL);
+  lv_obj_t *play_button = create_button(lv_scr_act(), "播放", 104, 58, home_play_event_cb, NULL);
   if (play_button != NULL) {
     lv_obj_align(play_button, LV_ALIGN_CENTER, 0, 52);
   }
 
-  lv_obj_t *volume_up_button = create_button(lv_scr_act(), "Vol+", 58, 58, home_volume_up_event_cb, NULL);
+  lv_obj_t *volume_up_button = create_button(lv_scr_act(), "音量+", 58, 58, home_volume_up_event_cb, NULL);
   if (volume_up_button != NULL) {
     lv_obj_align(volume_up_button, LV_ALIGN_CENTER, 96, 52);
   }
@@ -577,12 +760,12 @@ static void show_wifi_connect_page(const char *ssid)
     lv_obj_set_style_bg_color(header, lv_color_hex(0xe2e8f0), 0);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *back = create_button(header, "Back", 72, 30, connect_back_event_cb, NULL);
+    lv_obj_t *back = create_button(header, "返回", 72, 30, connect_back_event_cb, NULL);
     if (back != NULL) {
       lv_obj_align(back, LV_ALIGN_LEFT_MID, 4, 0);
     }
 
-    lv_obj_t *title = create_label(header, "Connect", &lv_font_chinese_16);
+    lv_obj_t *title = create_label(header, "连接 WiFi", ui_font());
     if (title != NULL) {
       lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
     }
@@ -590,7 +773,7 @@ static void show_wifi_connect_page(const char *ssid)
 
   char ssid_text[64];
   snprintf(ssid_text, sizeof(ssid_text), "SSID: %s", ssid != NULL ? ssid : "");
-  lv_obj_t *ssid_label = create_label(lv_scr_act(), ssid_text, &lv_font_chinese_16);
+  lv_obj_t *ssid_label = create_label(lv_scr_act(), ssid_text, ui_font());
   if (ssid_label != NULL) {
     lv_obj_set_width(ssid_label, LCD_H_RES - 24);
     lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
@@ -603,12 +786,12 @@ static void show_wifi_connect_page(const char *ssid)
     lv_obj_align(s_password_ta, LV_ALIGN_TOP_MID, 0, 78);
     lv_textarea_set_one_line(s_password_ta, true);
     lv_textarea_set_password_mode(s_password_ta, false);
-    lv_textarea_set_placeholder_text(s_password_ta, "Password");
+    lv_textarea_set_placeholder_text(s_password_ta, "请输入密码");
     lv_obj_add_event_cb(s_password_ta, textarea_event_cb, LV_EVENT_FOCUSED, NULL);
     lv_obj_add_state(s_password_ta, LV_STATE_FOCUSED);
   }
 
-  lv_obj_t *connect = create_button(lv_scr_act(), "Connect", LCD_H_RES - 24, 34, connect_event_cb, NULL);
+  lv_obj_t *connect = create_button(lv_scr_act(), "连接", LCD_H_RES - 24, 34, connect_event_cb, NULL);
   if (connect != NULL) {
     lv_obj_align(connect, LV_ALIGN_TOP_MID, 0, 122);
   }
@@ -638,23 +821,23 @@ static void show_wifi_page(void)
     lv_obj_set_style_bg_color(header, lv_color_hex(0xe2e8f0), 0);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *back = create_button(header, "Back", 72, 30, wifi_back_event_cb, NULL);
+    lv_obj_t *back = create_button(header, "返回", 72, 30, wifi_back_event_cb, NULL);
     if (back != NULL) {
       lv_obj_align(back, LV_ALIGN_LEFT_MID, 4, 0);
     }
 
-    lv_obj_t *title = create_label(header, "WiFi", &lv_font_chinese_16);
+    lv_obj_t *title = create_label(header, "WiFi", ui_font());
     if (title != NULL) {
       lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
     }
 
-    lv_obj_t *refresh = create_button(header, "Refresh", 86, 30, wifi_refresh_event_cb, NULL);
+    lv_obj_t *refresh = create_button(header, "刷新", 86, 30, wifi_refresh_event_cb, NULL);
     if (refresh != NULL) {
       lv_obj_align(refresh, LV_ALIGN_RIGHT_MID, -4, 0);
     }
   }
 
-  s_wifi_status_label = create_label(lv_scr_act(), "", &lv_font_chinese_16);
+  s_wifi_status_label = create_label(lv_scr_act(), "", ui_font());
   if (s_wifi_status_label != NULL) {
     lv_obj_set_width(s_wifi_status_label, LCD_H_RES - 24);
     lv_label_set_long_mode(s_wifi_status_label, LV_LABEL_LONG_WRAP);
@@ -680,7 +863,7 @@ static void show_wifi_page(void)
   app_wifi_get_status(&status);
   if (status.connected || status.connecting) {
     if (s_wifi_list != NULL) {
-      create_button(s_wifi_list, "Scan Again", LCD_H_RES - 32, 36, wifi_scan_event_cb, NULL);
+      create_button(s_wifi_list, "重新扫描", LCD_H_RES - 32, 36, wifi_scan_event_cb, NULL);
     }
   } else {
     start_wifi_scan();
@@ -848,6 +1031,7 @@ static esp_err_t touch_init(void)
 static esp_err_t lvgl_port_init(void)
 {
   lv_init();
+  load_external_font();
 
   s_lvgl_mutex = xSemaphoreCreateMutex();
   ESP_RETURN_ON_FALSE(s_lvgl_mutex, ESP_ERR_NO_MEM, TAG, "create LVGL mutex failed");

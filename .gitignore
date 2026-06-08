@@ -8,4 +8,7 @@ managed_components/
 sdkconfig.old
 *.elf
 *.bin
+!fonts/*.bin
+!font_partition/*.bin
+!font_active/*.bin
 *.map

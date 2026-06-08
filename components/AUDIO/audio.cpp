@@ -10,22 +10,36 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "micro_mp3/mp3_decoder.h"
 
 static const char *TAG = "audio";
 
 static i2s_chan_handle_t s_i2s_tx_chan;
 static SemaphoreHandle_t s_audio_mutex;
+static QueueHandle_t s_pcm_queue;
+static TaskHandle_t s_pcm_play_task_handle;
 static uint32_t s_current_sample_rate;
 static bool s_i2s_enabled;
 static volatile int s_volume_percent = 100;
 
 enum {
-  audio_volume_min_percent = 0,
+  audio_volume_min_percent = 10,
   audio_volume_max_percent = 200,
   audio_volume_step_percent = 10,
+  audio_pcm_queue_depth = 16,
+  audio_pcm_play_task_stack = 6144,
+  audio_pcm_play_task_priority = 5,
 };
+
+typedef struct {
+  uint8_t *data;
+  size_t bytes;
+  uint32_t sample_rate_hz;
+  int channels;
+} audio_pcm_queue_item_t;
 
 static int16_t audio_abs_i16(int16_t value)
 {
@@ -198,6 +212,62 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
   return ESP_OK;
 }
 
+static void audio_pcm_play_task(void *arg)
+{
+  (void)arg;
+
+  while (true) {
+    audio_pcm_queue_item_t item = {};
+    if (xQueueReceive(s_pcm_queue, &item, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    if (item.data == nullptr || item.bytes == 0) {
+      free(item.data);
+      continue;
+    }
+
+    if (xSemaphoreTake(s_audio_mutex, portMAX_DELAY) != pdTRUE) {
+      free(item.data);
+      continue;
+    }
+
+    esp_err_t ret = audio_configure_i2s(item.sample_rate_hz);
+    if (ret == ESP_OK) {
+      size_t sample_count = item.bytes / sizeof(int16_t);
+      int16_t *pcm = (int16_t *)item.data;
+      int16_t peak_before_gain = audio_pcm_peak(pcm, sample_count);
+      audio_apply_gain(pcm, sample_count);
+      int16_t peak_after_gain = audio_pcm_peak(pcm, sample_count);
+
+      size_t samples_per_channel = sample_count / (size_t)item.channels;
+      size_t bytes_written = 0;
+      ret = audio_write_pcm(pcm, samples_per_channel, item.channels, &bytes_written);
+      if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "write queued PCM failed: %s", esp_err_to_name(ret));
+      } else if (bytes_written > 0) {
+        ESP_LOGI(TAG,
+                 "queued PCM played: %u bytes, %lu Hz, channels=%d, volume=%d%%, peak=%d, peak_out=%d, i2s=%u",
+                 (unsigned)item.bytes,
+                 (unsigned long)item.sample_rate_hz,
+                 item.channels,
+                 audio_get_volume_percent(),
+                 peak_before_gain,
+                 peak_after_gain,
+                 (unsigned)bytes_written);
+      }
+    } else {
+      ESP_LOGE(TAG,
+               "configure queued PCM failed: %s, sample_rate=%lu",
+               esp_err_to_name(ret),
+               (unsigned long)item.sample_rate_hz);
+    }
+
+    xSemaphoreGive(s_audio_mutex);
+    free(item.data);
+  }
+}
+
 extern "C" esp_err_t audio_init(void)
 {
   if (s_i2s_tx_chan != nullptr) {
@@ -238,11 +308,59 @@ extern "C" esp_err_t audio_init(void)
   s_current_sample_rate = AUDIO_I2S_SAMPLE_RATE_HZ;
   s_i2s_enabled = true;
 
+  s_pcm_queue = xQueueCreate(audio_pcm_queue_depth, sizeof(audio_pcm_queue_item_t));
+  ESP_RETURN_ON_FALSE(s_pcm_queue != nullptr, ESP_ERR_NO_MEM, TAG, "create PCM queue failed");
+
+  BaseType_t task_ret = xTaskCreate(audio_pcm_play_task,
+                                    "audio_pcm_play",
+                                    audio_pcm_play_task_stack,
+                                    nullptr,
+                                    audio_pcm_play_task_priority,
+                                    &s_pcm_play_task_handle);
+  ESP_RETURN_ON_FALSE(task_ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create PCM playback task failed");
+
   ESP_LOGI(TAG,
            "MAX98357A I2S ready: BCLK=%d LRCLK=%d DIN=%d",
            AUDIO_I2S_PIN_BCLK,
            AUDIO_I2S_PIN_LRCLK,
            AUDIO_I2S_PIN_DIN);
+  return ESP_OK;
+}
+
+extern "C" esp_err_t audio_queue_pcm_s16le(const void *pcm,
+                                           size_t bytes,
+                                           uint32_t sample_rate_hz,
+                                           int channels)
+{
+  ESP_RETURN_ON_ERROR(audio_init(), TAG, "audio init failed");
+  ESP_RETURN_ON_FALSE(pcm != nullptr && bytes > 0, ESP_ERR_INVALID_ARG, TAG, "empty PCM");
+  ESP_RETURN_ON_FALSE((bytes % sizeof(int16_t)) == 0, ESP_ERR_INVALID_ARG, TAG, "unaligned PCM");
+  ESP_RETURN_ON_FALSE(sample_rate_hz > 0, ESP_ERR_INVALID_ARG, TAG, "invalid sample rate");
+  ESP_RETURN_ON_FALSE(channels == 1 || channels == 2, ESP_ERR_NOT_SUPPORTED, TAG, "unsupported channel count: %d", channels);
+
+  size_t sample_count = bytes / sizeof(int16_t);
+  ESP_RETURN_ON_FALSE((sample_count % (size_t)channels) == 0,
+                      ESP_ERR_INVALID_ARG,
+                      TAG,
+                      "PCM sample count does not match channels");
+
+  uint8_t *copy = (uint8_t *)malloc(bytes);
+  ESP_RETURN_ON_FALSE(copy != nullptr, ESP_ERR_NO_MEM, TAG, "copy queued PCM failed");
+  memcpy(copy, pcm, bytes);
+
+  audio_pcm_queue_item_t item = {
+    .data = copy,
+    .bytes = bytes,
+    .sample_rate_hz = sample_rate_hz,
+    .channels = channels,
+  };
+
+  if (xQueueSend(s_pcm_queue, &item, portMAX_DELAY) != pdTRUE) {
+    free(copy);
+    ESP_LOGW(TAG, "PCM playback queue is full");
+    return ESP_ERR_TIMEOUT;
+  }
+
   return ESP_OK;
 }
 

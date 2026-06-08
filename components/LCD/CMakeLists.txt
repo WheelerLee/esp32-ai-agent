@@ -14,6 +14,7 @@ set(requires
             esp_lcd_touch_xpt2046
             esp_timer
             lvgl
+            spiffs
             WIFI)
 
 idf_component_register(SRCS ${srcs}
