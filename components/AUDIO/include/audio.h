@@ -34,6 +34,7 @@ esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
                                           uint32_t sample_rate_hz,
                                           int channels,
                                           const char *text);
+void audio_stop_playback(void);
 void audio_set_pcm_playback_text_cb(audio_pcm_playback_text_cb_t cb);
 int audio_volume_up(void);
 int audio_volume_down(void);

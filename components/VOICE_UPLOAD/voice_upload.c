@@ -36,6 +36,7 @@ static i2s_chan_handle_t s_i2s_rx_chan;
 static esp_websocket_client_handle_t s_ws_client;
 static TaskHandle_t s_upload_task_handle;
 static volatile bool s_ws_connected;
+static volatile bool s_accept_tts = true;
 static bool s_ws_started;
 static bool s_initialized;
 
@@ -166,6 +167,11 @@ static char *take_tts_text(int response_id, int speech_index)
 
 static void handle_tts_start_json(const cJSON *root)
 {
+  if (!s_accept_tts) {
+    ESP_LOGI(TAG, "drop TTS start while new task is recording");
+    return;
+  }
+
   const cJSON *response_id = cJSON_GetObjectItem(root, "responseId");
   const cJSON *speech_index = cJSON_GetObjectItem(root, "speechIndex");
   const cJSON *text = cJSON_GetObjectItem(root, "text");
@@ -194,6 +200,11 @@ static void handle_asr_result_json(const cJSON *root)
 
 static void handle_tts_audio_json(const cJSON *root)
 {
+  if (!s_accept_tts) {
+    ESP_LOGI(TAG, "drop TTS audio metadata while new task is recording");
+    return;
+  }
+
   const cJSON *sample_rate = cJSON_GetObjectItem(root, "sampleRate");
   const cJSON *format = cJSON_GetObjectItem(root, "format");
   const cJSON *channels = cJSON_GetObjectItem(root, "channels");
@@ -303,6 +314,14 @@ static void handle_server_json(const char *json, int len)
 
 static void handle_server_binary(const uint8_t *data, int len)
 {
+  if (!s_accept_tts) {
+    if (s_tts_audio_rx.active) {
+      clear_pending_tts_audio();
+    }
+    ESP_LOGI(TAG, "drop TTS binary while new task is recording: %d bytes", len);
+    return;
+  }
+
   if (!s_tts_audio_rx.active || s_tts_audio_rx.data == NULL) {
     ESP_LOGW(TAG, "unexpected binary frame: %d bytes", len);
     return;
@@ -544,29 +563,36 @@ static esp_err_t send_heartbeat_if_due(int64_t *last_heartbeat_us)
 static esp_err_t record_and_upload(void)
 {
   lcd_show_user_speaking();
+  s_accept_tts = false;
+  esp_err_t ret = ESP_OK;
+  bool start_sent = false;
+  int32_t *raw = NULL;
+  int16_t *pcm = NULL;
+  int64_t last_heartbeat_us = 0;
+  size_t total_pcm_bytes = 0;
 
   if (!wifi_is_connected()) {
     ESP_LOGW(TAG, "WiFi is not connected, ignore recording request");
-    return ESP_ERR_INVALID_STATE;
+    ret = ESP_ERR_INVALID_STATE;
+    goto cleanup;
   }
 
-  ESP_RETURN_ON_ERROR(websocket_ensure_connected(), TAG, "WebSocket connect failed");
-  ESP_RETURN_ON_ERROR(send_heartbeat_if_due(&(int64_t){0}), TAG, "initial heartbeat failed");
-  ESP_RETURN_ON_ERROR(websocket_send_json_type("start"), TAG, "send start failed");
+  ESP_GOTO_ON_ERROR(websocket_ensure_connected(), cleanup, TAG, "WebSocket connect failed");
+  ESP_GOTO_ON_ERROR(send_heartbeat_if_due(&(int64_t){0}), cleanup, TAG, "initial heartbeat failed");
+  clear_pending_tts_audio();
+  clear_pending_tts_texts();
+  ESP_GOTO_ON_ERROR(websocket_send_json_type("start"), cleanup, TAG, "send start failed");
+  start_sent = true;
 
-  int32_t *raw = (int32_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int32_t));
-  int16_t *pcm = (int16_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int16_t));
+  raw = (int32_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int32_t));
+  pcm = (int16_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int16_t));
   if (raw == NULL || pcm == NULL) {
-    free(raw);
-    free(pcm);
-    websocket_send_json_type("end");
-    return ESP_ERR_NO_MEM;
+    ret = ESP_ERR_NO_MEM;
+    goto cleanup;
   }
 
   ESP_LOGI(TAG, "recording started");
-  esp_err_t ret = ESP_OK;
-  int64_t last_heartbeat_us = esp_timer_get_time();
-  size_t total_pcm_bytes = 0;
+  last_heartbeat_us = esp_timer_get_time();
 
   while (key_is_pressed() && s_ws_connected) {
     ESP_GOTO_ON_ERROR(send_heartbeat_if_due(&last_heartbeat_us), cleanup, TAG, "heartbeat failed");
@@ -593,10 +619,15 @@ static esp_err_t record_and_upload(void)
   }
 
 cleanup:
-  esp_err_t end_ret = websocket_send_json_type("end");
-  if (ret == ESP_OK && end_ret != ESP_OK) {
-    ret = end_ret;
+  if (start_sent) {
+    esp_err_t end_ret = websocket_send_json_type("end");
+    if (ret == ESP_OK && end_ret != ESP_OK) {
+      ret = end_ret;
+    }
   }
+  clear_pending_tts_audio();
+  clear_pending_tts_texts();
+  s_accept_tts = true;
 
   ESP_LOGI(TAG,
            "recording ended: ret=%s pcm_bytes=%u",
@@ -627,6 +658,11 @@ static void voice_upload_task(void *arg)
     if (event != KEY_EVENT_PRESSED) {
       continue;
     }
+
+    s_accept_tts = false;
+    clear_pending_tts_audio();
+    clear_pending_tts_texts();
+    audio_stop_playback();
 
     esp_err_t err = record_and_upload();
     if (err != ESP_OK) {

@@ -30,6 +30,7 @@ static TaskHandle_t s_pcm_play_task_handle;
 static uint32_t s_current_sample_rate;
 static bool s_i2s_enabled;
 static volatile int s_volume_level = 6;
+static volatile uint32_t s_playback_stop_generation;
 static audio_pcm_playback_text_cb_t s_pcm_playback_text_cb;
 
 enum {
@@ -38,13 +39,15 @@ enum {
   audio_volume_default_level = 6,
   audio_volume_percent_per_level = 20,
   audio_pcm_queue_depth = 16,
-  audio_i2s_dma_desc_num = 12,
-  audio_i2s_dma_frame_num = 512,
+  audio_i2s_dma_desc_num = 4,
+  audio_i2s_dma_frame_num = 128,
   audio_pcm_play_task_stack = 8192,
   audio_pcm_play_task_priority = 7,
   audio_playback_tail_silence_ms = 80,
   audio_i2s_idle_stop_delay_ms = 700,
   audio_start_prebuffer_ms = 350,
+  audio_i2s_write_timeout_ms = 20,
+  audio_interruptible_write_frames = 128,
   audio_mono_write_chunk_frames = 4096,
   audio_text_task_stack = 4096,
   audio_text_task_priority = 4,
@@ -56,6 +59,7 @@ typedef struct {
   size_t bytes;
   uint32_t sample_rate_hz;
   int channels;
+  uint32_t playback_generation;
   int64_t enqueue_us;
 } audio_pcm_queue_item_t;
 
@@ -106,6 +110,36 @@ static void audio_notify_playback_text_async(const char *text)
     ESP_LOGW(TAG, "create playback text task failed");
     free(text_copy);
   }
+}
+
+static bool audio_playback_stop_requested(uint32_t stop_generation)
+{
+  return stop_generation != s_playback_stop_generation;
+}
+
+static void audio_disable_i2s_for_stop(void)
+{
+  if (!s_i2s_enabled) {
+    return;
+  }
+
+  esp_err_t err = i2s_channel_disable(s_i2s_tx_chan);
+  if (err == ESP_OK) {
+    s_i2s_enabled = false;
+  } else {
+    ESP_LOGW(TAG, "disable I2S for playback stop failed: %s", esp_err_to_name(err));
+  }
+}
+
+static void audio_free_pcm_queue_item(audio_pcm_queue_item_t *item)
+{
+  if (item == nullptr) {
+    return;
+  }
+
+  free(item->data);
+  free(item->text);
+  memset(item, 0, sizeof(*item));
 }
 
 static int audio_clamp_volume_level(int volume_level)
@@ -301,7 +335,8 @@ static esp_err_t audio_configure_i2s(uint32_t sample_rate_hz)
 static esp_err_t audio_write_pcm(const int16_t *pcm,
                                  size_t samples_per_channel,
                                  int channels,
-                                 size_t *bytes_written_total)
+                                 size_t *bytes_written_total,
+                                 uint32_t stop_generation)
 {
   if (pcm == nullptr || samples_per_channel == 0 || channels <= 0) {
     if (bytes_written_total != nullptr) {
@@ -312,20 +347,59 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
 
   size_t total_written = 0;
   if (channels >= 2) {
-    size_t bytes_written = 0;
-    size_t expected_bytes = samples_per_channel * 2 * sizeof(int16_t);
-    esp_err_t err = i2s_channel_write(s_i2s_tx_chan,
-                                      pcm,
-                                      expected_bytes,
-                                      &bytes_written,
-                                      portMAX_DELAY);
+    size_t offset = 0;
+    while (offset < samples_per_channel) {
+      if (audio_playback_stop_requested(stop_generation)) {
+        if (bytes_written_total != nullptr) {
+          *bytes_written_total = total_written;
+        }
+        return ESP_ERR_INVALID_STATE;
+      }
+
+      size_t chunk = samples_per_channel - offset;
+      if (chunk > audio_interruptible_write_frames) {
+        chunk = audio_interruptible_write_frames;
+      }
+
+      size_t bytes_written = 0;
+      size_t expected_bytes = chunk * 2 * sizeof(int16_t);
+      esp_err_t err = i2s_channel_write(s_i2s_tx_chan,
+                                        pcm + offset * 2,
+                                        expected_bytes,
+                                        &bytes_written,
+                                        pdMS_TO_TICKS(audio_i2s_write_timeout_ms));
+      if (audio_playback_stop_requested(stop_generation)) {
+        if (bytes_written_total != nullptr) {
+          *bytes_written_total = total_written + bytes_written;
+        }
+        return ESP_ERR_INVALID_STATE;
+      }
+      size_t written_frames = bytes_written / (2 * sizeof(int16_t));
+      if (written_frames > 0) {
+        total_written += bytes_written;
+        offset += written_frames;
+      }
+      if (err != ESP_OK) {
+        if (err == ESP_ERR_TIMEOUT) {
+          continue;
+        }
+        if (bytes_written_total != nullptr) {
+          *bytes_written_total = total_written;
+        }
+        return err;
+      }
+      if (bytes_written != expected_bytes) {
+        ESP_LOGW(TAG, "partial I2S stereo write: %u/%u bytes", (unsigned)bytes_written, (unsigned)expected_bytes);
+      }
+      if (written_frames == 0) {
+        offset += chunk;
+      }
+    }
+
     if (bytes_written_total != nullptr) {
-      *bytes_written_total = bytes_written;
+      *bytes_written_total = total_written;
     }
-    if (err == ESP_OK && bytes_written != expected_bytes) {
-      ESP_LOGW(TAG, "partial I2S stereo write: %u/%u bytes", (unsigned)bytes_written, (unsigned)expected_bytes);
-    }
-    return err;
+    return ESP_OK;
   }
 
   int16_t *stereo = (int16_t *)malloc(audio_mono_write_chunk_frames * 2 * sizeof(int16_t));
@@ -333,9 +407,17 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
 
   size_t offset = 0;
   while (offset < samples_per_channel) {
+    if (audio_playback_stop_requested(stop_generation)) {
+      if (bytes_written_total != nullptr) {
+        *bytes_written_total = total_written;
+      }
+      free(stereo);
+      return ESP_ERR_INVALID_STATE;
+    }
+
     size_t chunk = samples_per_channel - offset;
-    if (chunk > audio_mono_write_chunk_frames) {
-      chunk = audio_mono_write_chunk_frames;
+    if (chunk > audio_interruptible_write_frames) {
+      chunk = audio_interruptible_write_frames;
     }
 
     for (size_t i = 0; i < chunk; ++i) {
@@ -349,8 +431,23 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
                                       stereo,
                                       expected_bytes,
                                       &bytes_written,
-                                      portMAX_DELAY);
+                                      pdMS_TO_TICKS(audio_i2s_write_timeout_ms));
+    if (audio_playback_stop_requested(stop_generation)) {
+      if (bytes_written_total != nullptr) {
+        *bytes_written_total = total_written + bytes_written;
+      }
+      free(stereo);
+      return ESP_ERR_INVALID_STATE;
+    }
+    size_t written_frames = bytes_written / (2 * sizeof(int16_t));
+    if (written_frames > 0) {
+      total_written += bytes_written;
+      offset += written_frames;
+    }
     if (err != ESP_OK) {
+      if (err == ESP_ERR_TIMEOUT) {
+        continue;
+      }
       free(stereo);
       ESP_LOGE(TAG, "write mono PCM failed: %s", esp_err_to_name(err));
       return err;
@@ -358,8 +455,9 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
     if (bytes_written != expected_bytes) {
       ESP_LOGW(TAG, "partial I2S mono write: %u/%u bytes", (unsigned)bytes_written, (unsigned)expected_bytes);
     }
-    total_written += bytes_written;
-    offset += chunk;
+    if (written_frames == 0) {
+      offset += chunk;
+    }
   }
 
   if (bytes_written_total != nullptr) {
@@ -384,7 +482,7 @@ static esp_err_t audio_write_tail_silence(uint32_t sample_rate_hz)
     }
 
     size_t bytes_written = 0;
-    ESP_RETURN_ON_ERROR(audio_write_pcm(silence, chunk, 2, &bytes_written),
+    ESP_RETURN_ON_ERROR(audio_write_pcm(silence, chunk, 2, &bytes_written, s_playback_stop_generation),
                         TAG,
                         "write playback tail silence failed");
     silence_frames -= chunk;
@@ -432,16 +530,28 @@ static void audio_pcm_play_task(void *arg)
       continue;
     }
 
+    uint32_t stop_generation = item.playback_generation;
+    if (audio_playback_stop_requested(stop_generation)) {
+      audio_free_pcm_queue_item(&item);
+      continue;
+    }
+
     if (playback_idle) {
       vTaskDelay(pdMS_TO_TICKS(audio_start_prebuffer_ms));
     }
 
     if (xSemaphoreTake(s_audio_mutex, portMAX_DELAY) != pdTRUE) {
-      free(item.data);
-      free(item.text);
+      audio_free_pcm_queue_item(&item);
       continue;
     }
 
+    if (audio_playback_stop_requested(stop_generation)) {
+      xSemaphoreGive(s_audio_mutex);
+      audio_free_pcm_queue_item(&item);
+      continue;
+    }
+
+    bool playback_stopped = false;
     esp_err_t ret = audio_configure_i2s(item.sample_rate_hz);
     if (ret == ESP_OK) {
       audio_notify_playback_text_async(item.text);
@@ -455,9 +565,13 @@ static void audio_pcm_play_task(void *arg)
       size_t samples_per_channel = sample_count / (size_t)item.channels;
       size_t bytes_written = 0;
       int64_t write_start_us = esp_timer_get_time();
-      ret = audio_write_pcm(pcm, samples_per_channel, item.channels, &bytes_written);
+      ret = audio_write_pcm(pcm, samples_per_channel, item.channels, &bytes_written, stop_generation);
       int64_t write_us = esp_timer_get_time() - write_start_us;
-      if (ret != ESP_OK) {
+      if (ret == ESP_ERR_INVALID_STATE && audio_playback_stop_requested(stop_generation)) {
+        audio_disable_i2s_for_stop();
+        playback_stopped = true;
+        ESP_LOGI(TAG, "queued PCM playback stopped");
+      } else if (ret != ESP_OK) {
         ESP_LOGE(TAG, "write queued PCM failed: %s", esp_err_to_name(ret));
       } else if (bytes_written > 0) {
         uint32_t audio_ms = (uint32_t)(samples_per_channel * 1000U / item.sample_rate_hz);
@@ -484,9 +598,8 @@ static void audio_pcm_play_task(void *arg)
     }
 
     xSemaphoreGive(s_audio_mutex);
-    playback_idle = false;
-    free(item.data);
-    free(item.text);
+    playback_idle = playback_stopped;
+    audio_free_pcm_queue_item(&item);
   }
 }
 
@@ -560,6 +673,28 @@ extern "C" esp_err_t audio_init(void)
   return ESP_OK;
 }
 
+extern "C" void audio_stop_playback(void)
+{
+  ++s_playback_stop_generation;
+
+  if (s_pcm_queue != nullptr) {
+    audio_pcm_queue_item_t item = {};
+    uint32_t cleared = 0;
+    while (xQueueReceive(s_pcm_queue, &item, 0) == pdTRUE) {
+      audio_free_pcm_queue_item(&item);
+      ++cleared;
+    }
+    if (cleared > 0) {
+      ESP_LOGI(TAG, "cleared queued PCM: %lu item(s)", (unsigned long)cleared);
+    }
+  }
+
+  if (s_audio_mutex != nullptr && xSemaphoreTake(s_audio_mutex, 0) == pdTRUE) {
+    audio_disable_i2s_for_stop();
+    xSemaphoreGive(s_audio_mutex);
+  }
+}
+
 extern "C" esp_err_t audio_queue_pcm_s16le(const void *pcm,
                                            size_t bytes,
                                            uint32_t sample_rate_hz,
@@ -603,6 +738,7 @@ extern "C" esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
     .bytes = bytes,
     .sample_rate_hz = sample_rate_hz,
     .channels = channels,
+    .playback_generation = s_playback_stop_generation,
     .enqueue_us = esp_timer_get_time(),
   };
 
@@ -654,6 +790,7 @@ extern "C" esp_err_t audio_play_test_tone(void)
   };
 
   ESP_RETURN_ON_ERROR(audio_configure_i2s(AUDIO_I2S_SAMPLE_RATE_HZ), TAG, "configure test tone failed");
+  uint32_t stop_generation = s_playback_stop_generation;
   ESP_LOGI(TAG,
            "play test tone: %d Hz, %d ms, amplitude=%d",
            tone_hz,
@@ -680,9 +817,17 @@ extern "C" esp_err_t audio_play_test_tone(void)
     audio_apply_gain(samples, chunk_frames * 2);
 
     size_t bytes_written = 0;
-    ESP_RETURN_ON_ERROR(audio_write_pcm(samples, chunk_frames, 2, &bytes_written),
-                        TAG,
-                        "write test tone failed");
+    esp_err_t write_ret = audio_write_pcm(samples,
+                                          chunk_frames,
+                                          2,
+                                          &bytes_written,
+                                          stop_generation);
+    if (write_ret == ESP_ERR_INVALID_STATE && audio_playback_stop_requested(stop_generation)) {
+      audio_disable_i2s_for_stop();
+      ESP_LOGI(TAG, "test tone stopped");
+      return write_ret;
+    }
+    ESP_RETURN_ON_ERROR(write_ret, TAG, "write test tone failed");
     written_frames += chunk_frames;
   }
 
@@ -699,6 +844,7 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
     return ESP_ERR_INVALID_STATE;
   }
 
+  uint32_t stop_generation = s_playback_stop_generation;
   esp_err_t ret = ESP_OK;
   esp_http_client_handle_t client = nullptr;
   uint8_t *input_buf = nullptr;
@@ -841,7 +987,12 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
       }
 
       size_t bytes_written = 0;
-      ret = audio_write_pcm(pcm_buf, samples, channels, &bytes_written);
+      ret = audio_write_pcm(pcm_buf, samples, channels, &bytes_written, stop_generation);
+      if (ret == ESP_ERR_INVALID_STATE && audio_playback_stop_requested(stop_generation)) {
+        audio_disable_i2s_for_stop();
+        ESP_LOGI(TAG, "MP3 playback stopped");
+        break;
+      }
       if (ret != ESP_OK) {
         ESP_LOGE(TAG, "write decoded PCM failed");
         break;
