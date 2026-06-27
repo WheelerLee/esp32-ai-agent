@@ -139,7 +139,7 @@ static void load_external_font(void)
   esp_vfs_spiffs_conf_t conf = {
     .base_path = LCD_FONT_MOUNT_POINT,
     .partition_label = LCD_FONT_PARTITION_LABEL,
-    .max_files = 2,
+    .max_files = 5,
     .format_if_mount_failed = false,
   };
 

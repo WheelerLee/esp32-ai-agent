@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "key.h"
 #include "lcd.h"
@@ -30,8 +31,10 @@ static const char *TAG = "voice_upload";
 
 #define VOICE_UPLOAD_TASK_STACK 12288
 #define VOICE_UPLOAD_TASK_PRIORITY 5
+#define VOICE_UPLOAD_WS_MONITOR_TASK_STACK 4096
 #define VOICE_UPLOAD_HEARTBEAT_MS 30000
 #define VOICE_UPLOAD_CONNECT_TIMEOUT_MS 10000
+#define VOICE_UPLOAD_STARTUP_WS_TIMEOUT_MS 30000
 #define VOICE_UPLOAD_SEND_TIMEOUT_TICKS pdMS_TO_TICKS(3000)
 #define VOICE_UPLOAD_RECONNECT_DELAY_MS 1000
 #define VOICE_UPLOAD_FRAMES_PER_CHUNK 512
@@ -47,7 +50,7 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_VAD_MAX_RECORD_CHUNKS 500
 #define VOICE_UPLOAD_SPEAKING_TASK_STACK 2048
 #define VOICE_UPLOAD_RESPONSE_IDLE_TIMEOUT_MS 15000
-#define VOICE_UPLOAD_VAD_DEBUG_ONLY 1
+#define VOICE_UPLOAD_VAD_DEBUG_ONLY 0
 #define VOICE_UPLOAD_VAD_PEAK_AVG_RATIO_MAX 5
 #define VOICE_UPLOAD_AFE_DEBUG_ENABLE 1
 #define VOICE_UPLOAD_AFE_LOG_INTERVAL 100
@@ -64,11 +67,17 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_MULTINET_TIMEOUT_MS 3000
 #define VOICE_UPLOAD_MULTINET_RESET_SILENCE_CHUNKS 10
 #define VOICE_UPLOAD_BUTTON_MIN_RECORD_CHUNKS 5
+#define VOICE_UPLOAD_READY_PROMPT_RECORD_DELAY_MS 850
+#define VOICE_UPLOAD_PROMPT_NET_ERROR "/font/net_error.wav"
+#define VOICE_UPLOAD_PROMPT_NET_ERROR_AND_TRY "/font/net_error_and_try.wav"
+#define VOICE_UPLOAD_PROMPT_IM_READY "/font/im_ready.wav"
 
 static i2s_chan_handle_t s_i2s_rx_chan;
 static esp_websocket_client_handle_t s_ws_client;
 static TaskHandle_t s_upload_task_handle;
 static TaskHandle_t s_idle_vad_task_handle;
+static TaskHandle_t s_ws_monitor_task_handle;
+static SemaphoreHandle_t s_ws_mutex;
 static volatile bool s_ws_connected;
 static volatile bool s_accept_tts = true;
 static volatile bool s_idle_vad_paused;
@@ -202,6 +211,148 @@ static char *voice_upload_strdup(const char *text)
     memcpy(copy, text, len + 1);
   }
   return copy;
+}
+
+static uint16_t voice_read_le16(const uint8_t *data)
+{
+  return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static uint32_t voice_read_le32(const uint8_t *data)
+{
+  return (uint32_t)data[0] |
+         ((uint32_t)data[1] << 8) |
+         ((uint32_t)data[2] << 16) |
+         ((uint32_t)data[3] << 24);
+}
+
+static esp_err_t voice_skip_file_bytes(FILE *file, uint32_t bytes)
+{
+  if (bytes == 0) {
+    return ESP_OK;
+  }
+  return fseek(file, (long)bytes, SEEK_CUR) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t voice_play_wav_prompt(const char *path, bool wait_done)
+{
+  FILE *file = fopen(path, "rb");
+  ESP_RETURN_ON_FALSE(file != NULL, ESP_ERR_NOT_FOUND, TAG, "open prompt failed: %s", path);
+
+  esp_err_t ret = ESP_OK;
+  uint8_t header[12] = {0};
+  uint16_t audio_format = 0;
+  uint16_t channels = 0;
+  uint32_t sample_rate_hz = 0;
+  uint16_t bits_per_sample = 0;
+  uint32_t data_bytes = 0;
+  uint8_t *pcm = NULL;
+
+  if (fread(header, 1, sizeof(header), file) != sizeof(header) ||
+      memcmp(header, "RIFF", 4) != 0 ||
+      memcmp(header + 8, "WAVE", 4) != 0) {
+    ret = ESP_ERR_INVALID_ARG;
+    goto cleanup;
+  }
+
+  while (true) {
+    uint8_t chunk_header[8] = {0};
+    if (fread(chunk_header, 1, sizeof(chunk_header), file) != sizeof(chunk_header)) {
+      ret = ESP_ERR_INVALID_SIZE;
+      goto cleanup;
+    }
+
+    uint32_t chunk_size = voice_read_le32(chunk_header + 4);
+    if (memcmp(chunk_header, "fmt ", 4) == 0) {
+      uint8_t fmt[16] = {0};
+      if (chunk_size < sizeof(fmt) || fread(fmt, 1, sizeof(fmt), file) != sizeof(fmt)) {
+        ret = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
+      }
+      audio_format = voice_read_le16(fmt);
+      channels = voice_read_le16(fmt + 2);
+      sample_rate_hz = voice_read_le32(fmt + 4);
+      bits_per_sample = voice_read_le16(fmt + 14);
+      ret = voice_skip_file_bytes(file, chunk_size - sizeof(fmt));
+      if (ret != ESP_OK) {
+        goto cleanup;
+      }
+    } else if (memcmp(chunk_header, "data", 4) == 0) {
+      data_bytes = chunk_size;
+      break;
+    } else {
+      ret = voice_skip_file_bytes(file, chunk_size);
+      if (ret != ESP_OK) {
+        goto cleanup;
+      }
+    }
+
+    if ((chunk_size & 1U) != 0U) {
+      ret = voice_skip_file_bytes(file, 1);
+      if (ret != ESP_OK) {
+        goto cleanup;
+      }
+    }
+  }
+
+  if (audio_format != 1 ||
+      (channels != 1 && channels != 2) ||
+      sample_rate_hz == 0 ||
+      bits_per_sample != 16 ||
+      data_bytes == 0 ||
+      (data_bytes % (sizeof(int16_t) * channels)) != 0) {
+    ESP_LOGW(TAG,
+             "unsupported prompt WAV: path=%s format=%u channels=%u rate=%lu bits=%u bytes=%lu",
+             path,
+             audio_format,
+             channels,
+             (unsigned long)sample_rate_hz,
+             bits_per_sample,
+             (unsigned long)data_bytes);
+    ret = ESP_ERR_NOT_SUPPORTED;
+    goto cleanup;
+  }
+
+  pcm = (uint8_t *)malloc(data_bytes);
+  if (pcm == NULL) {
+    ret = ESP_ERR_NO_MEM;
+    goto cleanup;
+  }
+  if (fread(pcm, 1, data_bytes, file) != data_bytes) {
+    ret = ESP_ERR_INVALID_SIZE;
+    goto cleanup;
+  }
+
+  ret = audio_queue_pcm_s16le(pcm, data_bytes, sample_rate_hz, channels);
+  if (ret != ESP_OK) {
+    goto cleanup;
+  }
+
+  ESP_LOGI(TAG,
+           "prompt queued: %s bytes=%lu rate=%lu channels=%u wait=%d",
+           path,
+           (unsigned long)data_bytes,
+           (unsigned long)sample_rate_hz,
+           channels,
+           wait_done);
+
+  if (wait_done) {
+    size_t frames = data_bytes / (sizeof(int16_t) * channels);
+    int64_t deadline = esp_timer_get_time() +
+                       ((int64_t)frames * 1000000 / sample_rate_hz) +
+                       2000000;
+    while (audio_is_playback_active() && esp_timer_get_time() < deadline) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+  }
+
+cleanup:
+  free(pcm);
+  fclose(file);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "play prompt failed: %s %s", path, esp_err_to_name(ret));
+  }
+  return ret;
 }
 
 static void voice_multinet_reset(void)
@@ -1165,10 +1316,18 @@ static bool wifi_is_connected(void)
 
 static esp_err_t websocket_ensure_connected(void)
 {
+  if (s_ws_mutex != NULL) {
+    xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
+  }
+
   if (s_ws_client != NULL && s_ws_connected) {
+    if (s_ws_mutex != NULL) {
+      xSemaphoreGive(s_ws_mutex);
+    }
     return ESP_OK;
   }
 
+  esp_err_t ret = ESP_OK;
   if (s_ws_client == NULL) {
     esp_websocket_client_config_t ws_cfg = {
       .uri = VOICE_UPLOAD_WS_URI,
@@ -1178,19 +1337,29 @@ static esp_err_t websocket_ensure_connected(void)
     };
 
     s_ws_client = esp_websocket_client_init(&ws_cfg);
-    ESP_RETURN_ON_FALSE(s_ws_client != NULL, ESP_ERR_NO_MEM, TAG, "create WebSocket client failed");
-    ESP_RETURN_ON_ERROR(esp_websocket_register_events(s_ws_client,
-                                                      WEBSOCKET_EVENT_ANY,
-                                                      websocket_event_handler,
-                                                      NULL),
-                        TAG,
-                        "register WebSocket events failed");
+    if (s_ws_client == NULL) {
+      ret = ESP_ERR_NO_MEM;
+      ESP_LOGE(TAG, "create WebSocket client failed");
+      goto cleanup;
+    }
+    ret = esp_websocket_register_events(s_ws_client,
+                                        WEBSOCKET_EVENT_ANY,
+                                        websocket_event_handler,
+                                        NULL);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "register WebSocket events failed: %s", esp_err_to_name(ret));
+      goto cleanup;
+    }
   }
 
   if (!s_ws_started) {
     s_ws_connected = false;
     ESP_LOGI(TAG, "connecting WebSocket: %s", VOICE_UPLOAD_WS_URI);
-    ESP_RETURN_ON_ERROR(esp_websocket_client_start(s_ws_client), TAG, "start WebSocket client failed");
+    ret = esp_websocket_client_start(s_ws_client);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "start WebSocket client failed: %s", esp_err_to_name(ret));
+      goto cleanup;
+    }
     s_ws_started = true;
   }
 
@@ -1200,13 +1369,20 @@ static esp_err_t websocket_ensure_connected(void)
   }
 
   if (s_ws_connected) {
-    return ESP_OK;
+    ret = ESP_OK;
+    goto cleanup;
   }
 
   ESP_LOGW(TAG, "WebSocket connect timeout, restart client next time");
   esp_websocket_client_stop(s_ws_client);
   s_ws_started = false;
-  return ESP_ERR_TIMEOUT;
+  ret = ESP_ERR_TIMEOUT;
+
+cleanup:
+  if (s_ws_mutex != NULL) {
+    xSemaphoreGive(s_ws_mutex);
+  }
+  return ret;
 }
 
 static esp_err_t websocket_send_text(const char *text)
@@ -1236,6 +1412,34 @@ static esp_err_t websocket_send_bin(const int16_t *pcm, size_t sample_count)
                                           (int)(sample_count * sizeof(int16_t)),
                                           VOICE_UPLOAD_SEND_TIMEOUT_TICKS);
   return ret >= 0 ? ESP_OK : ESP_FAIL;
+}
+
+static void voice_ws_monitor_task(void *arg)
+{
+  (void)arg;
+  int64_t startup_deadline = esp_timer_get_time() +
+                             (int64_t)VOICE_UPLOAD_STARTUP_WS_TIMEOUT_MS * 1000;
+  bool startup_prompt_played = false;
+
+  while (true) {
+    if (!s_ws_connected && wifi_is_connected()) {
+      esp_err_t err = websocket_ensure_connected();
+      if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+        ESP_LOGW(TAG, "background WebSocket connect failed: %s", esp_err_to_name(err));
+      }
+    }
+
+    if (!startup_prompt_played &&
+        !s_ws_connected &&
+        esp_timer_get_time() >= startup_deadline) {
+      ESP_LOGW(TAG, "startup WebSocket is not connected after %d ms",
+               VOICE_UPLOAD_STARTUP_WS_TIMEOUT_MS);
+      voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_NET_ERROR, false);
+      startup_prompt_played = true;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RECONNECT_DELAY_MS));
+  }
 }
 
 static int16_t convert_mic_sample(int32_t sample)
@@ -1576,10 +1780,27 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
 
   *voice_chunks = 0;
   *multinet_silence_chunks = 0;
+
+  if (!s_ws_connected) {
+    ESP_LOGW(TAG, "wake phrase ignored because WebSocket is not connected");
+    audio_stop_playback();
+    voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_NET_ERROR_AND_TRY, false);
+    voice_set_state(VOICE_STATE_IDLE);
+    return ESP_OK;
+  }
+
   ESP_LOGI(TAG, "begin auto record after wake phrase");
   clear_pending_tts_audio();
   clear_pending_tts_texts();
   audio_stop_playback();
+
+  voice_set_state(VOICE_STATE_SPEAKING);
+  esp_err_t prompt_ret = voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_IM_READY, false);
+  if (prompt_ret != ESP_OK) {
+    ESP_LOGW(TAG, "ready prompt failed, continue recording: %s", esp_err_to_name(prompt_ret));
+  } else {
+    vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_READY_PROMPT_RECORD_DELAY_MS));
+  }
 
   ret = record_and_upload(RECORD_STOP_BY_SILENCE);
   if (ret != ESP_OK) {
@@ -1593,6 +1814,7 @@ static void handle_button_record(void)
 {
   s_idle_vad_paused = true;
   voice_multinet_reset();
+  esp_err_t err = ESP_OK;
 
   ESP_LOGI(TAG,
            "button record requested: pressed=%d ws_connected=%d state=%d",
@@ -1605,13 +1827,22 @@ static void handle_button_record(void)
   clear_pending_tts_texts();
   audio_stop_playback();
 
-  esp_err_t err = record_and_upload(RECORD_STOP_BY_KEY);
+  if (!s_ws_connected) {
+    ESP_LOGW(TAG, "button record ignored because WebSocket is not connected");
+    voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_NET_ERROR_AND_TRY, false);
+    voice_set_state(VOICE_STATE_IDLE);
+    goto cleanup;
+  }
+
+  err = record_and_upload(RECORD_STOP_BY_KEY);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "record/upload failed: %s", esp_err_to_name(err));
     voice_set_state(VOICE_STATE_IDLE);
     vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RECONNECT_DELAY_MS));
   }
 
+cleanup:
+  s_accept_tts = true;
   while (key_is_pressed()) {
     vTaskDelay(pdMS_TO_TICKS(20));
   }
@@ -1731,6 +1962,8 @@ esp_err_t voice_upload_init(void)
 
   ESP_RETURN_ON_ERROR(key_init(), TAG, "key init failed");
   ESP_RETURN_ON_ERROR(voice_i2s_init(), TAG, "voice I2S init failed");
+  s_ws_mutex = xSemaphoreCreateMutex();
+  ESP_RETURN_ON_FALSE(s_ws_mutex != NULL, ESP_ERR_NO_MEM, TAG, "create WebSocket mutex failed");
   voice_log_model_partition_probe();
   esp_err_t sr_ret = voice_srmodel_init();
   if (sr_ret != ESP_OK) {
@@ -1758,6 +1991,14 @@ esp_err_t voice_upload_init(void)
                     VOICE_UPLOAD_TASK_PRIORITY - 1,
                     &s_idle_vad_task_handle);
   ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create idle VAD task failed");
+
+  ret = xTaskCreate(voice_ws_monitor_task,
+                    "voice_ws_monitor",
+                    VOICE_UPLOAD_WS_MONITOR_TASK_STACK,
+                    NULL,
+                    VOICE_UPLOAD_TASK_PRIORITY - 1,
+                    &s_ws_monitor_task_handle);
+  ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create WebSocket monitor task failed");
 
   s_initialized = true;
   ESP_LOGI(TAG, "voice upload ready: ws=%s", VOICE_UPLOAD_WS_URI);
