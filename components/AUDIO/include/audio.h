@@ -1,6 +1,7 @@
 #ifndef AUDIO_H
 #define AUDIO_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,6 +13,10 @@ extern "C" {
 #endif
 
 typedef void (*audio_pcm_playback_text_cb_t)(const char *text);
+typedef void (*audio_pcm_playback_ref_cb_t)(const int16_t *pcm,
+                                            size_t frames,
+                                            int channels,
+                                            uint32_t sample_rate_hz);
 
 // MAX98357A I2S pins. These GPIOs are currently unused by LCD, touch, key, LED,
 // USB, and boot strapping in this project.
@@ -35,7 +40,9 @@ esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
                                           int channels,
                                           const char *text);
 void audio_stop_playback(void);
+bool audio_is_playback_active(void);
 void audio_set_pcm_playback_text_cb(audio_pcm_playback_text_cb_t cb);
+void audio_set_pcm_playback_ref_cb(audio_pcm_playback_ref_cb_t cb);
 int audio_volume_up(void);
 int audio_volume_down(void);
 int audio_get_volume_level(void);

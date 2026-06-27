@@ -31,7 +31,9 @@ static uint32_t s_current_sample_rate;
 static bool s_i2s_enabled;
 static volatile int s_volume_level = 6;
 static volatile uint32_t s_playback_stop_generation;
+static volatile bool s_pcm_playback_active;
 static audio_pcm_playback_text_cb_t s_pcm_playback_text_cb;
+static audio_pcm_playback_ref_cb_t s_pcm_playback_ref_cb;
 
 enum {
   audio_volume_min_level = 0,
@@ -49,6 +51,7 @@ enum {
   audio_i2s_write_timeout_ms = 20,
   audio_interruptible_write_frames = 128,
   audio_mono_write_chunk_frames = 4096,
+  audio_pcm_play_log_interval = 16,
   audio_text_task_stack = 4096,
   audio_text_task_priority = 4,
 };
@@ -110,6 +113,20 @@ static void audio_notify_playback_text_async(const char *text)
     ESP_LOGW(TAG, "create playback text task failed");
     free(text_copy);
   }
+}
+
+static void audio_notify_playback_ref(const int16_t *pcm,
+                                      size_t frames,
+                                      int channels,
+                                      uint32_t sample_rate_hz)
+{
+  audio_pcm_playback_ref_cb_t cb = s_pcm_playback_ref_cb;
+  if (cb == nullptr || pcm == nullptr || frames == 0 || channels <= 0 ||
+      sample_rate_hz == 0) {
+    return;
+  }
+
+  cb(pcm, frames, channels, sample_rate_hz);
 }
 
 static bool audio_playback_stop_requested(uint32_t stop_generation)
@@ -301,7 +318,6 @@ static esp_err_t audio_configure_i2s(uint32_t sample_rate_hz)
   }
 
   if (s_current_sample_rate == sample_rate_hz && s_i2s_enabled) {
-    ESP_LOGI(TAG, "I2S already configured: %lu Hz", (unsigned long)sample_rate_hz);
     return ESP_OK;
   }
 
@@ -376,6 +392,10 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
       }
       size_t written_frames = bytes_written / (2 * sizeof(int16_t));
       if (written_frames > 0) {
+        audio_notify_playback_ref(pcm + offset * 2,
+                                  written_frames,
+                                  2,
+                                  s_current_sample_rate);
         total_written += bytes_written;
         offset += written_frames;
       }
@@ -441,6 +461,10 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
     }
     size_t written_frames = bytes_written / (2 * sizeof(int16_t));
     if (written_frames > 0) {
+      audio_notify_playback_ref(pcm + offset,
+                                written_frames,
+                                1,
+                                s_current_sample_rate);
       total_written += bytes_written;
       offset += written_frames;
     }
@@ -509,6 +533,7 @@ static void audio_pcm_play_task(void *arg)
 {
   (void)arg;
   bool playback_idle = true;
+  uint32_t played_items = 0;
 
   while (true) {
     audio_pcm_queue_item_t item = {};
@@ -521,6 +546,8 @@ static void audio_pcm_play_task(void *arg)
         xSemaphoreGive(s_audio_mutex);
       }
       playback_idle = true;
+      played_items = 0;
+      s_pcm_playback_active = false;
       continue;
     }
 
@@ -576,19 +603,26 @@ static void audio_pcm_play_task(void *arg)
       } else if (bytes_written > 0) {
         uint32_t audio_ms = (uint32_t)(samples_per_channel * 1000U / item.sample_rate_hz);
         int64_t queue_wait_us = write_start_us - item.enqueue_us;
-        ESP_LOGI(TAG,
-                 "queued PCM played: %u bytes, %lu Hz, channels=%d, audio_ms=%u queue_wait=%lld ms write=%lld ms q_left=%u volume=%d/10 peak=%d peak_out=%d i2s=%u",
-                 (unsigned)item.bytes,
-                 (unsigned long)item.sample_rate_hz,
-                 item.channels,
-                 (unsigned)audio_ms,
-                 (long long)(queue_wait_us / 1000),
-                 (long long)(write_us / 1000),
-                 (unsigned)uxQueueMessagesWaiting(s_pcm_queue),
-                 audio_get_volume_level(),
-                 peak_before_gain,
-                 peak_after_gain,
-                 (unsigned)bytes_written);
+        uint32_t queued_items = uxQueueMessagesWaiting(s_pcm_queue);
+        ++played_items;
+        if (played_items <= 2 ||
+            queued_items == 0 ||
+            (played_items % audio_pcm_play_log_interval) == 0U) {
+          ESP_LOGI(TAG,
+                   "queued PCM played: item=%lu bytes=%u, %lu Hz, channels=%d, audio_ms=%u queue_wait=%lld ms write=%lld ms q_left=%u volume=%d/10 peak=%d peak_out=%d i2s=%u",
+                   (unsigned long)played_items,
+                   (unsigned)item.bytes,
+                   (unsigned long)item.sample_rate_hz,
+                   item.channels,
+                   (unsigned)audio_ms,
+                   (long long)(queue_wait_us / 1000),
+                   (long long)(write_us / 1000),
+                   (unsigned)queued_items,
+                   audio_get_volume_level(),
+                   peak_before_gain,
+                   peak_after_gain,
+                   (unsigned)bytes_written);
+        }
       }
     } else {
       ESP_LOGE(TAG,
@@ -676,6 +710,7 @@ extern "C" esp_err_t audio_init(void)
 extern "C" void audio_stop_playback(void)
 {
   ++s_playback_stop_generation;
+  s_pcm_playback_active = false;
 
   if (s_pcm_queue != nullptr) {
     audio_pcm_queue_item_t item = {};
@@ -749,12 +784,27 @@ extern "C" esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
     return ESP_ERR_TIMEOUT;
   }
 
+  s_pcm_playback_active = true;
   return ESP_OK;
+}
+
+extern "C" bool audio_is_playback_active(void)
+{
+  if (s_pcm_playback_active) {
+    return true;
+  }
+
+  return s_pcm_queue != nullptr && uxQueueMessagesWaiting(s_pcm_queue) > 0;
 }
 
 extern "C" void audio_set_pcm_playback_text_cb(audio_pcm_playback_text_cb_t cb)
 {
   s_pcm_playback_text_cb = cb;
+}
+
+extern "C" void audio_set_pcm_playback_ref_cb(audio_pcm_playback_ref_cb_t cb)
+{
+  s_pcm_playback_ref_cb = cb;
 }
 
 extern "C" int audio_get_volume_level(void)

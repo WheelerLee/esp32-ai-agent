@@ -10,18 +10,25 @@
 #include "audio.h"
 #include "cJSON.h"
 #include "driver/i2s_std.h"
+#include "esp_afe_sr_iface.h"
+#include "esp_afe_sr_models.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_mn_iface.h"
+#include "esp_mn_models.h"
+#include "esp_mn_speech_commands.h"
+#include "esp_partition.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "key.h"
 #include "lcd.h"
+#include "model_path.h"
 
 static const char *TAG = "voice_upload";
 
-#define VOICE_UPLOAD_TASK_STACK 8192
+#define VOICE_UPLOAD_TASK_STACK 12288
 #define VOICE_UPLOAD_TASK_PRIORITY 5
 #define VOICE_UPLOAD_HEARTBEAT_MS 30000
 #define VOICE_UPLOAD_CONNECT_TIMEOUT_MS 10000
@@ -31,14 +38,75 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_MIC_SHIFT 14
 #define VOICE_UPLOAD_WS_RX_BUFFER_BYTES 4096
 #define VOICE_UPLOAD_TTS_TEXT_SLOTS 4
+#define VOICE_UPLOAD_IDLE_READ_TIMEOUT_MS 30
+#define VOICE_UPLOAD_VAD_AVG_THRESHOLD 220
+#define VOICE_UPLOAD_VAD_PEAK_THRESHOLD 900
+#define VOICE_UPLOAD_VAD_START_CHUNKS 3
+#define VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS 25
+#define VOICE_UPLOAD_VAD_MIN_RECORD_CHUNKS 12
+#define VOICE_UPLOAD_VAD_MAX_RECORD_CHUNKS 500
+#define VOICE_UPLOAD_SPEAKING_TASK_STACK 2048
+#define VOICE_UPLOAD_RESPONSE_IDLE_TIMEOUT_MS 15000
+#define VOICE_UPLOAD_VAD_DEBUG_ONLY 1
+#define VOICE_UPLOAD_VAD_PEAK_AVG_RATIO_MAX 5
+#define VOICE_UPLOAD_AFE_DEBUG_ENABLE 1
+#define VOICE_UPLOAD_AFE_LOG_INTERVAL 100
+#define VOICE_UPLOAD_AFE_REF_BUFFER_SAMPLES 2048
+#define VOICE_UPLOAD_IDLE_VAD_LOG_INTERVAL 100
+#define VOICE_UPLOAD_RECORD_VAD_LOG_INTERVAL 20
+#define VOICE_UPLOAD_VAD_DEBUG_COOLDOWN_CHUNKS 100
+#define VOICE_UPLOAD_HUMAN_VOICE_LOG_COOLDOWN_CHUNKS 200
+#define VOICE_UPLOAD_TTS_CHUNK_LOG_INTERVAL 16
+#define VOICE_UPLOAD_MULTINET_MODEL_NAME "mn7_cn"
+#define VOICE_UPLOAD_MULTINET_WAKE_PHRASE "xi xi tong xue"
+#define VOICE_UPLOAD_MULTINET_WAKE_DISPLAY "溪溪同学"
+#define VOICE_UPLOAD_MULTINET_WAKE_COMMAND_ID 1
+#define VOICE_UPLOAD_MULTINET_TIMEOUT_MS 3000
+#define VOICE_UPLOAD_MULTINET_RESET_SILENCE_CHUNKS 10
+#define VOICE_UPLOAD_BUTTON_MIN_RECORD_CHUNKS 5
 
 static i2s_chan_handle_t s_i2s_rx_chan;
 static esp_websocket_client_handle_t s_ws_client;
 static TaskHandle_t s_upload_task_handle;
+static TaskHandle_t s_idle_vad_task_handle;
 static volatile bool s_ws_connected;
 static volatile bool s_accept_tts = true;
+static volatile bool s_idle_vad_paused;
 static bool s_ws_started;
 static bool s_initialized;
+#if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+static const esp_afe_sr_iface_t *s_afe_handle;
+static esp_afe_sr_data_t *s_afe_data;
+static int16_t *s_afe_feed_buffer;
+static int s_afe_feed_chunksize;
+static int s_afe_feed_channels;
+static size_t s_afe_pending_samples;
+static uint32_t s_afe_feed_count;
+static uint32_t s_afe_fetch_count;
+static int16_t *s_afe_ref_ring;
+static size_t s_afe_ref_ring_size;
+static size_t s_afe_ref_read_pos;
+static size_t s_afe_ref_write_pos;
+static size_t s_afe_ref_count;
+static uint32_t s_afe_ref_sample_rate;
+static uint32_t s_afe_ref_resample_accum;
+static vad_state_t s_afe_last_vad_state = VAD_SILENCE;
+static vad_state_t s_afe_logged_vad_state = VAD_SILENCE;
+static portMUX_TYPE s_afe_ref_mux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
+typedef enum {
+  VOICE_STATE_IDLE = 0,
+  VOICE_STATE_VAD_ACTIVE,
+  VOICE_STATE_RECORDING,
+  VOICE_STATE_WAITING_RESPONSE,
+  VOICE_STATE_SPEAKING,
+} voice_state_t;
+
+typedef enum {
+  RECORD_STOP_BY_KEY = 0,
+  RECORD_STOP_BY_SILENCE,
+} record_stop_mode_t;
 
 typedef struct {
   bool active;
@@ -61,8 +129,66 @@ typedef struct {
   char *text;
 } tts_text_slot_t;
 
+typedef struct {
+  bool active;
+  char *data;
+  size_t expected_bytes;
+  size_t received_bytes;
+} ws_text_rx_t;
+
 static tts_audio_rx_t s_tts_audio_rx;
 static tts_text_slot_t s_tts_text_slots[VOICE_UPLOAD_TTS_TEXT_SLOTS];
+static ws_text_rx_t s_ws_text_rx;
+static volatile voice_state_t s_voice_state = VOICE_STATE_IDLE;
+static volatile uint32_t s_state_generation;
+static const esp_mn_iface_t *s_mn_handle;
+static model_iface_data_t *s_mn_data;
+static int16_t *s_mn_feed_buffer;
+static int s_mn_feed_chunksize;
+static int s_mn_sample_rate;
+static size_t s_mn_pending_samples;
+static bool s_mn_ready;
+static bool s_mn_init_attempted;
+static srmodel_list_t *s_srmodels;
+
+static esp_err_t voice_srmodel_init(void);
+
+static void voice_set_state(voice_state_t state)
+{
+  if (s_voice_state == state) {
+    return;
+  }
+
+  s_voice_state = state;
+  ++s_state_generation;
+}
+
+static void waiting_response_timeout_task(void *arg)
+{
+  uint32_t generation = (uint32_t)(uintptr_t)arg;
+
+  vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RESPONSE_IDLE_TIMEOUT_MS));
+  if (generation == s_state_generation && s_voice_state == VOICE_STATE_WAITING_RESPONSE) {
+    ESP_LOGW(TAG, "response timeout, return to idle");
+    voice_set_state(VOICE_STATE_IDLE);
+  }
+
+  vTaskDelete(NULL);
+}
+
+static void schedule_waiting_response_timeout(void)
+{
+  uint32_t generation = s_state_generation;
+  BaseType_t ret = xTaskCreate(waiting_response_timeout_task,
+                               "voice_resp_timeout",
+                               VOICE_UPLOAD_SPEAKING_TASK_STACK,
+                               (void *)(uintptr_t)generation,
+                               VOICE_UPLOAD_TASK_PRIORITY - 1,
+                               NULL);
+  if (ret != pdPASS) {
+    ESP_LOGW(TAG, "create response timeout task failed");
+  }
+}
 
 static char *voice_upload_strdup(const char *text)
 {
@@ -76,6 +202,255 @@ static char *voice_upload_strdup(const char *text)
     memcpy(copy, text, len + 1);
   }
   return copy;
+}
+
+static void voice_multinet_reset(void)
+{
+  if (s_mn_handle != NULL && s_mn_data != NULL && s_mn_handle->clean != NULL) {
+    s_mn_handle->clean(s_mn_data);
+  }
+  s_mn_pending_samples = 0;
+}
+
+static esp_err_t voice_multinet_init(void)
+{
+  if (s_mn_ready) {
+    return ESP_OK;
+  }
+
+  ESP_RETURN_ON_ERROR(voice_srmodel_init(), TAG, "SR model init failed");
+
+  s_mn_handle = esp_mn_handle_from_name((char *)VOICE_UPLOAD_MULTINET_MODEL_NAME);
+  ESP_RETURN_ON_FALSE(s_mn_handle != NULL,
+                      ESP_ERR_NOT_FOUND,
+                      TAG,
+                      "MultiNet model unavailable: %s",
+                      VOICE_UPLOAD_MULTINET_MODEL_NAME);
+
+  s_mn_data = s_mn_handle->create(VOICE_UPLOAD_MULTINET_MODEL_NAME,
+                                  VOICE_UPLOAD_MULTINET_TIMEOUT_MS);
+  ESP_RETURN_ON_FALSE(s_mn_data != NULL,
+                      ESP_ERR_NO_MEM,
+                      TAG,
+                      "create MultiNet model failed");
+
+  s_mn_feed_chunksize = s_mn_handle->get_samp_chunksize(s_mn_data);
+  s_mn_sample_rate = s_mn_handle->get_samp_rate(s_mn_data);
+  ESP_RETURN_ON_FALSE(s_mn_feed_chunksize > 0 && s_mn_sample_rate > 0,
+                      ESP_ERR_INVALID_STATE,
+                      TAG,
+                      "invalid MultiNet params: chunk=%d sample_rate=%d",
+                      s_mn_feed_chunksize,
+                      s_mn_sample_rate);
+  ESP_RETURN_ON_FALSE(s_mn_sample_rate == VOICE_UPLOAD_SAMPLE_RATE_HZ,
+                      ESP_ERR_INVALID_STATE,
+                      TAG,
+                      "MultiNet sample rate mismatch: model=%d mic=%d",
+                      s_mn_sample_rate,
+                      VOICE_UPLOAD_SAMPLE_RATE_HZ);
+
+  s_mn_feed_buffer = (int16_t *)malloc((size_t)s_mn_feed_chunksize * sizeof(int16_t));
+  ESP_RETURN_ON_FALSE(s_mn_feed_buffer != NULL,
+                      ESP_ERR_NO_MEM,
+                      TAG,
+                      "allocate MultiNet buffer failed");
+
+  esp_err_t ret = esp_mn_commands_alloc(s_mn_handle, s_mn_data);
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    ESP_LOGW(TAG, "allocate MultiNet commands failed: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  ret = esp_mn_commands_clear();
+  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+    ESP_LOGW(TAG, "clear MultiNet commands failed: %s", esp_err_to_name(ret));
+  }
+
+  ret = esp_mn_commands_add(VOICE_UPLOAD_MULTINET_WAKE_COMMAND_ID,
+                            VOICE_UPLOAD_MULTINET_WAKE_PHRASE);
+  ESP_RETURN_ON_ERROR(ret, TAG, "add MultiNet wake phrase failed");
+
+  esp_mn_error_t *cmd_err = esp_mn_commands_update();
+  ESP_RETURN_ON_FALSE(cmd_err == NULL,
+                      ESP_ERR_INVALID_STATE,
+                      TAG,
+                      "MultiNet wake phrase cannot be parsed: command=%s display=%s",
+                      VOICE_UPLOAD_MULTINET_WAKE_PHRASE,
+                      VOICE_UPLOAD_MULTINET_WAKE_DISPLAY);
+
+  s_mn_ready = true;
+  ESP_LOGI(TAG,
+           "MultiNet ready: model=%s command=%s display=%s command_id=%d chunk=%d sample_rate=%d timeout_ms=%d",
+           VOICE_UPLOAD_MULTINET_MODEL_NAME,
+           VOICE_UPLOAD_MULTINET_WAKE_PHRASE,
+           VOICE_UPLOAD_MULTINET_WAKE_DISPLAY,
+           VOICE_UPLOAD_MULTINET_WAKE_COMMAND_ID,
+           s_mn_feed_chunksize,
+           s_mn_sample_rate,
+           VOICE_UPLOAD_MULTINET_TIMEOUT_MS);
+  return ESP_OK;
+}
+
+static bool voice_multinet_feed(const int16_t *pcm, size_t samples)
+{
+  if (!s_mn_ready && !s_mn_init_attempted) {
+    s_mn_init_attempted = true;
+    esp_err_t ret = voice_multinet_init();
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "MultiNet wake disabled: %s", esp_err_to_name(ret));
+      s_mn_pending_samples = 0;
+    }
+  }
+
+  if (!s_mn_ready || s_mn_handle == NULL || s_mn_data == NULL || s_mn_feed_buffer == NULL ||
+      pcm == NULL || samples == 0) {
+    return false;
+  }
+
+  size_t offset = 0;
+  while (offset < samples) {
+    size_t need = (size_t)s_mn_feed_chunksize - s_mn_pending_samples;
+    size_t copy_samples = samples - offset;
+    if (copy_samples > need) {
+      copy_samples = need;
+    }
+
+    memcpy(&s_mn_feed_buffer[s_mn_pending_samples],
+           &pcm[offset],
+           copy_samples * sizeof(int16_t));
+    s_mn_pending_samples += copy_samples;
+    offset += copy_samples;
+
+    if (s_mn_pending_samples < (size_t)s_mn_feed_chunksize) {
+      continue;
+    }
+
+    s_mn_pending_samples = 0;
+    esp_mn_state_t state = s_mn_handle->detect(s_mn_data, s_mn_feed_buffer);
+    if (state == ESP_MN_STATE_DETECTING) {
+      continue;
+    }
+
+    if (state == ESP_MN_STATE_TIMEOUT) {
+      voice_multinet_reset();
+      continue;
+    }
+
+    if (state != ESP_MN_STATE_DETECTED) {
+      continue;
+    }
+
+    esp_mn_results_t *results = s_mn_handle->get_results(s_mn_data);
+    if (results == NULL) {
+      ESP_LOGW(TAG, "MultiNet detected but result is NULL");
+      voice_multinet_reset();
+      continue;
+    }
+
+    if (results->num > 0) {
+      ESP_LOGI(TAG,
+               "MultiNet result: num=%d top_id=%d top_prob=%d.%03d text=%s raw=%s",
+               results->num,
+               results->command_id[0],
+               (int)results->prob[0],
+               (int)(results->prob[0] * 1000.0f) % 1000,
+               results->string,
+               results->raw_string);
+    }
+
+    for (int i = 0; i < results->num && i < ESP_MN_RESULT_MAX_NUM; ++i) {
+      if (results->command_id[i] == VOICE_UPLOAD_MULTINET_WAKE_COMMAND_ID) {
+        ESP_LOGI(TAG,
+                 "wake phrase detected: phrase=%s command=%s prob=%d.%03d text=%s raw=%s",
+                 VOICE_UPLOAD_MULTINET_WAKE_DISPLAY,
+                 VOICE_UPLOAD_MULTINET_WAKE_PHRASE,
+                 (int)results->prob[i],
+                 (int)(results->prob[i] * 1000.0f) % 1000,
+                 results->string,
+                 results->raw_string);
+        voice_multinet_reset();
+        return true;
+      }
+    }
+
+    voice_multinet_reset();
+  }
+
+  return false;
+}
+
+static void voice_log_model_partition_probe(void)
+{
+  const esp_partition_t *partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                                              ESP_PARTITION_SUBTYPE_ANY,
+                                                              "model");
+  if (partition == NULL) {
+    ESP_LOGW(TAG, "model partition probe: partition not found");
+    return;
+  }
+
+  uint8_t header[16] = {0};
+  esp_err_t ret = esp_partition_read(partition, 0, header, sizeof(header));
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "model partition probe: read failed: %s", esp_err_to_name(ret));
+    return;
+  }
+
+  uint32_t model_count = (uint32_t)header[0] |
+                         ((uint32_t)header[1] << 8) |
+                         ((uint32_t)header[2] << 16) |
+                         ((uint32_t)header[3] << 24);
+  ESP_LOGI(TAG,
+           "model partition probe: offset=0x%lx size=%lu model_count=%lu head=%02x %02x %02x %02x",
+           (unsigned long)partition->address,
+           (unsigned long)partition->size,
+           (unsigned long)model_count,
+           header[0],
+           header[1],
+           header[2],
+           header[3]);
+}
+
+static esp_err_t voice_srmodel_init(void)
+{
+  if (s_srmodels != NULL) {
+    return ESP_OK;
+  }
+
+  s_srmodels = esp_srmodel_init("model");
+  ESP_RETURN_ON_FALSE(s_srmodels != NULL,
+                      ESP_ERR_NOT_FOUND,
+                      TAG,
+                      "load SR model list failed");
+
+  ESP_LOGI(TAG, "SR model list ready: count=%d", s_srmodels->num);
+  for (int i = 0; i < s_srmodels->num; ++i) {
+    ESP_LOGI(TAG,
+             "SR model[%d]: name=%s info=%s",
+             i,
+             s_srmodels->model_name != NULL && s_srmodels->model_name[i] != NULL
+                 ? s_srmodels->model_name[i]
+                 : "",
+             s_srmodels->model_info != NULL && s_srmodels->model_info[i] != NULL
+                 ? s_srmodels->model_info[i]
+                 : "");
+  }
+
+  ESP_RETURN_ON_FALSE(esp_srmodel_exists(s_srmodels,
+                                         (char *)VOICE_UPLOAD_MULTINET_MODEL_NAME) >= 0,
+                      ESP_ERR_NOT_FOUND,
+                      TAG,
+                      "MultiNet model is not in SR model list: %s",
+                      VOICE_UPLOAD_MULTINET_MODEL_NAME);
+
+  return ESP_OK;
+}
+
+static bool should_log_tts_chunk(int chunk_index, const char *text)
+{
+  return chunk_index <= 1 ||
+         (chunk_index % VOICE_UPLOAD_TTS_CHUNK_LOG_INTERVAL) == 0 ||
+         (text != NULL && text[0] != '\0');
 }
 
 static void clear_pending_tts_audio(void)
@@ -100,6 +475,12 @@ static void clear_pending_tts_texts(void)
   for (size_t i = 0; i < VOICE_UPLOAD_TTS_TEXT_SLOTS; ++i) {
     clear_tts_text_slot(&s_tts_text_slots[i]);
   }
+}
+
+static void clear_pending_ws_text(void)
+{
+  free(s_ws_text_rx.data);
+  memset(&s_ws_text_rx, 0, sizeof(s_ws_text_rx));
 }
 
 static bool tts_ids_match(const tts_text_slot_t *slot, int response_id, int speech_index)
@@ -253,15 +634,17 @@ static void handle_tts_audio_json(const cJSON *root)
   s_tts_audio_rx.meta_us = esp_timer_get_time();
   s_tts_audio_rx.text = take_tts_text(s_tts_audio_rx.response_id, s_tts_audio_rx.speech_index);
 
-  ESP_LOGI(TAG,
-           "expect TTS PCM: response=%d speech=%d chunk=%d bytes=%u rate=%lu channels=%d text=%s",
-           s_tts_audio_rx.response_id,
-           s_tts_audio_rx.speech_index,
-           s_tts_audio_rx.chunk_index,
-           (unsigned)s_tts_audio_rx.expected_bytes,
-           (unsigned long)s_tts_audio_rx.sample_rate_hz,
-           s_tts_audio_rx.channels,
-           s_tts_audio_rx.text != NULL ? s_tts_audio_rx.text : "");
+  if (should_log_tts_chunk(s_tts_audio_rx.chunk_index, s_tts_audio_rx.text)) {
+    ESP_LOGI(TAG,
+             "expect TTS PCM: response=%d speech=%d chunk=%d bytes=%u rate=%lu channels=%d text=%s",
+             s_tts_audio_rx.response_id,
+             s_tts_audio_rx.speech_index,
+             s_tts_audio_rx.chunk_index,
+             (unsigned)s_tts_audio_rx.expected_bytes,
+             (unsigned long)s_tts_audio_rx.sample_rate_hz,
+             s_tts_audio_rx.channels,
+             s_tts_audio_rx.text != NULL ? s_tts_audio_rx.text : "");
+  }
 }
 
 static void handle_server_json(const char *json, int len)
@@ -297,6 +680,16 @@ static void handle_server_json(const char *json, int len)
     ESP_LOGI(TAG, "server: %.*s", len, json);
   } else if (strcmp(type->valuestring, "tts_audio") == 0) {
     handle_tts_audio_json(root);
+  } else if (strcmp(type->valuestring, "tts_finished") == 0) {
+    ESP_LOGI(TAG, "server: %.*s", len, json);
+    if (!audio_is_playback_active() && s_voice_state != VOICE_STATE_RECORDING) {
+      voice_set_state(VOICE_STATE_IDLE);
+    }
+  } else if (strcmp(type->valuestring, "ai_finished") == 0) {
+    ESP_LOGI(TAG, "server: %.*s", len, json);
+    if (!audio_is_playback_active() && s_voice_state != VOICE_STATE_RECORDING) {
+      voice_set_state(VOICE_STATE_IDLE);
+    }
   } else if (strcmp(type->valuestring, "error") == 0) {
     const cJSON *stage = cJSON_GetObjectItem(root, "stage");
     const cJSON *message = cJSON_GetObjectItem(root, "message");
@@ -304,6 +697,7 @@ static void handle_server_json(const char *json, int len)
              "server error: stage=%s message=%s",
              cJSON_IsString(stage) ? stage->valuestring : "?",
              cJSON_IsString(message) ? message->valuestring : "?");
+    voice_set_state(VOICE_STATE_IDLE);
   } else {
     ESP_LOGI(TAG, "server: %.*s", len, json);
   }
@@ -349,13 +743,15 @@ static void handle_server_binary(const uint8_t *data, int len)
   }
 
   int64_t receive_us = esp_timer_get_time() - s_tts_audio_rx.meta_us;
-  ESP_LOGI(TAG,
-           "TTS PCM complete: response=%d speech=%d chunk=%d bytes=%u receive=%lld ms",
-           s_tts_audio_rx.response_id,
-           s_tts_audio_rx.speech_index,
-           s_tts_audio_rx.chunk_index,
-           (unsigned)s_tts_audio_rx.expected_bytes,
-           (long long)(receive_us / 1000));
+  if (should_log_tts_chunk(s_tts_audio_rx.chunk_index, s_tts_audio_rx.text)) {
+    ESP_LOGI(TAG,
+             "TTS PCM complete: response=%d speech=%d chunk=%d bytes=%u receive=%lld ms",
+             s_tts_audio_rx.response_id,
+             s_tts_audio_rx.speech_index,
+             s_tts_audio_rx.chunk_index,
+             (unsigned)s_tts_audio_rx.expected_bytes,
+             (long long)(receive_us / 1000));
+  }
 
   esp_err_t err = audio_queue_pcm_s16le_with_text(s_tts_audio_rx.data,
                                                   s_tts_audio_rx.expected_bytes,
@@ -364,9 +760,68 @@ static void handle_server_binary(const uint8_t *data, int len)
                                                   s_tts_audio_rx.text);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "queue TTS PCM failed: %s", esp_err_to_name(err));
+  } else {
+    voice_set_state(VOICE_STATE_SPEAKING);
   }
 
   clear_pending_tts_audio();
+}
+
+static void handle_server_text_event(const esp_websocket_event_data_t *data)
+{
+  if (data == NULL || data->data_ptr == NULL || data->data_len <= 0) {
+    return;
+  }
+
+  size_t payload_len = data->payload_len > 0 ? (size_t)data->payload_len : (size_t)data->data_len;
+  size_t payload_offset = data->payload_offset > 0 ? (size_t)data->payload_offset : 0;
+  bool fragmented = s_ws_text_rx.active ||
+                    payload_offset > 0 ||
+                    payload_len > (size_t)data->data_len ||
+                    !data->fin;
+
+  if (!fragmented) {
+    handle_server_json((const char *)data->data_ptr, data->data_len);
+    return;
+  }
+
+  if (!s_ws_text_rx.active || payload_offset == 0) {
+    clear_pending_ws_text();
+    s_ws_text_rx.data = (char *)malloc(payload_len + 1U);
+    if (s_ws_text_rx.data == NULL) {
+      ESP_LOGE(TAG, "allocate WebSocket text buffer failed: %u bytes", (unsigned)payload_len);
+      return;
+    }
+    s_ws_text_rx.active = true;
+    s_ws_text_rx.expected_bytes = payload_len;
+  }
+
+  if (!s_ws_text_rx.active ||
+      payload_len != s_ws_text_rx.expected_bytes ||
+      payload_offset + (size_t)data->data_len > s_ws_text_rx.expected_bytes) {
+    ESP_LOGW(TAG,
+             "invalid fragmented WebSocket text: offset=%u len=%d total=%u expected=%u",
+             (unsigned)payload_offset,
+             data->data_len,
+             (unsigned)payload_len,
+             (unsigned)s_ws_text_rx.expected_bytes);
+    clear_pending_ws_text();
+    return;
+  }
+
+  memcpy(s_ws_text_rx.data + payload_offset, data->data_ptr, (size_t)data->data_len);
+  size_t end = payload_offset + (size_t)data->data_len;
+  if (end > s_ws_text_rx.received_bytes) {
+    s_ws_text_rx.received_bytes = end;
+  }
+
+  if (s_ws_text_rx.received_bytes < s_ws_text_rx.expected_bytes) {
+    return;
+  }
+
+  s_ws_text_rx.data[s_ws_text_rx.expected_bytes] = '\0';
+  handle_server_json(s_ws_text_rx.data, (int)s_ws_text_rx.expected_bytes);
+  clear_pending_ws_text();
 }
 
 static void websocket_event_handler(void *handler_args,
@@ -388,14 +843,17 @@ static void websocket_event_handler(void *handler_args,
     s_ws_connected = false;
     clear_pending_tts_audio();
     clear_pending_tts_texts();
+    clear_pending_ws_text();
+    voice_set_state(VOICE_STATE_IDLE);
     ESP_LOGW(TAG, "WebSocket disconnected");
     break;
   case WEBSOCKET_EVENT_DATA:
     if (data == NULL || data->data_len <= 0) {
       break;
     }
-    if (data->op_code == WS_TRANSPORT_OPCODES_TEXT) {
-      handle_server_json((const char *)data->data_ptr, data->data_len);
+    if (data->op_code == WS_TRANSPORT_OPCODES_TEXT ||
+        (data->op_code == WS_TRANSPORT_OPCODES_CONT && s_ws_text_rx.active)) {
+      handle_server_text_event(data);
     } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY ||
                (data->op_code == WS_TRANSPORT_OPCODES_CONT && s_tts_audio_rx.active)) {
       handle_server_binary((const uint8_t *)data->data_ptr, data->data_len);
@@ -452,6 +910,251 @@ static esp_err_t voice_i2s_init(void)
            VOICE_UPLOAD_SAMPLE_RATE_HZ);
   return ESP_OK;
 }
+
+#if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+static void voice_afe_ref_push_sample_locked(int16_t sample)
+{
+  if (s_afe_ref_ring == NULL || s_afe_ref_ring_size == 0) {
+    return;
+  }
+
+  s_afe_ref_ring[s_afe_ref_write_pos] = sample;
+  s_afe_ref_write_pos = (s_afe_ref_write_pos + 1U) % s_afe_ref_ring_size;
+  if (s_afe_ref_count < s_afe_ref_ring_size) {
+    ++s_afe_ref_count;
+  } else {
+    s_afe_ref_read_pos = (s_afe_ref_read_pos + 1U) % s_afe_ref_ring_size;
+  }
+}
+
+static int16_t voice_afe_ref_pop_sample(void)
+{
+  int16_t sample = 0;
+
+  portENTER_CRITICAL(&s_afe_ref_mux);
+  if (s_afe_ref_ring != NULL && s_afe_ref_count > 0) {
+    sample = s_afe_ref_ring[s_afe_ref_read_pos];
+    s_afe_ref_read_pos = (s_afe_ref_read_pos + 1U) % s_afe_ref_ring_size;
+    --s_afe_ref_count;
+  }
+  portEXIT_CRITICAL(&s_afe_ref_mux);
+
+  return sample;
+}
+
+static size_t voice_afe_ref_available(void)
+{
+  size_t count = 0;
+
+  portENTER_CRITICAL(&s_afe_ref_mux);
+  count = s_afe_ref_count;
+  portEXIT_CRITICAL(&s_afe_ref_mux);
+
+  return count;
+}
+
+static uint32_t voice_afe_ref_sample_rate(void)
+{
+  uint32_t sample_rate = 0;
+
+  portENTER_CRITICAL(&s_afe_ref_mux);
+  sample_rate = s_afe_ref_sample_rate;
+  portEXIT_CRITICAL(&s_afe_ref_mux);
+
+  return sample_rate;
+}
+
+static vad_state_t voice_afe_last_vad_state(void)
+{
+  return s_afe_last_vad_state;
+}
+
+static void voice_afe_playback_ref_cb(const int16_t *pcm,
+                                      size_t frames,
+                                      int channels,
+                                      uint32_t sample_rate_hz)
+{
+  if (pcm == NULL || frames == 0 || channels <= 0 || sample_rate_hz == 0) {
+    return;
+  }
+
+  portENTER_CRITICAL(&s_afe_ref_mux);
+  if (s_afe_ref_sample_rate != sample_rate_hz) {
+    s_afe_ref_sample_rate = sample_rate_hz;
+    s_afe_ref_resample_accum = 0;
+  }
+
+  for (size_t i = 0; i < frames; ++i) {
+    int16_t sample = pcm[i * (size_t)channels];
+    if (channels >= 2) {
+      int32_t mixed = (int32_t)pcm[i * (size_t)channels] +
+                      (int32_t)pcm[i * (size_t)channels + 1U];
+      sample = (int16_t)(mixed / 2);
+    }
+
+    s_afe_ref_resample_accum += VOICE_UPLOAD_SAMPLE_RATE_HZ;
+    while (s_afe_ref_resample_accum >= sample_rate_hz) {
+      voice_afe_ref_push_sample_locked(sample);
+      s_afe_ref_resample_accum -= sample_rate_hz;
+    }
+  }
+  portEXIT_CRITICAL(&s_afe_ref_mux);
+}
+
+static esp_err_t voice_afe_debug_init(void)
+{
+  if (s_afe_data != NULL) {
+    return ESP_OK;
+  }
+
+  esp_err_t sr_ret = voice_srmodel_init();
+  if (sr_ret != ESP_OK) {
+    ESP_LOGW(TAG, "SR model list unavailable for AFE: %s", esp_err_to_name(sr_ret));
+  }
+
+  esp_log_level_set("AFE_CONFIG", ESP_LOG_ERROR);
+  afe_config_t *afe_config = afe_config_init("MR",
+                                             s_srmodels,
+                                             AFE_TYPE_SR,
+                                             AFE_MODE_LOW_COST);
+  esp_log_level_set("AFE_CONFIG", ESP_LOG_WARN);
+  ESP_RETURN_ON_FALSE(afe_config != NULL, ESP_ERR_NO_MEM, TAG, "create AFE config failed");
+
+  afe_config->wakenet_init = false;
+  afe_config->se_init = false;
+  afe_config->vad_init = true;
+  afe_config->aec_init = true;
+  afe_config->ns_init = false;
+  afe_config->agc_init = false;
+
+  s_afe_handle = esp_afe_handle_from_config(afe_config);
+  if (s_afe_handle == NULL) {
+    afe_config_free(afe_config);
+    ESP_LOGW(TAG, "AFE handle is unavailable");
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  s_afe_data = s_afe_handle->create_from_config(afe_config);
+  afe_config_free(afe_config);
+  ESP_RETURN_ON_FALSE(s_afe_data != NULL, ESP_ERR_NO_MEM, TAG, "create AFE failed");
+
+  s_afe_feed_chunksize = s_afe_handle->get_feed_chunksize(s_afe_data);
+  s_afe_feed_channels = s_afe_handle->get_feed_channel_num(s_afe_data);
+  ESP_RETURN_ON_FALSE(s_afe_feed_chunksize > 0 && s_afe_feed_channels > 0,
+                      ESP_ERR_INVALID_STATE,
+                      TAG,
+                      "invalid AFE feed shape: chunksize=%d channels=%d",
+                      s_afe_feed_chunksize,
+                      s_afe_feed_channels);
+
+  s_afe_feed_buffer = (int16_t *)calloc((size_t)s_afe_feed_chunksize *
+                                          (size_t)s_afe_feed_channels,
+                                        sizeof(int16_t));
+  if (s_afe_feed_buffer == NULL) {
+    s_afe_handle->destroy(s_afe_data);
+    s_afe_data = NULL;
+    return ESP_ERR_NO_MEM;
+  }
+
+  s_afe_ref_ring_size = VOICE_UPLOAD_AFE_REF_BUFFER_SAMPLES;
+  s_afe_ref_ring = (int16_t *)calloc(s_afe_ref_ring_size, sizeof(int16_t));
+  if (s_afe_ref_ring == NULL) {
+    free(s_afe_feed_buffer);
+    s_afe_feed_buffer = NULL;
+    s_afe_handle->destroy(s_afe_data);
+    s_afe_data = NULL;
+    return ESP_ERR_NO_MEM;
+  }
+
+  audio_set_pcm_playback_ref_cb(voice_afe_playback_ref_cb);
+
+  ESP_LOGI(TAG,
+           "AFE debug ready: feed_chunksize=%d feed_channels=%d fetch_chunksize=%d ref_buffer=%u samples",
+           s_afe_feed_chunksize,
+           s_afe_feed_channels,
+           s_afe_handle->get_fetch_chunksize(s_afe_data),
+           (unsigned)s_afe_ref_ring_size);
+  return ESP_OK;
+}
+
+static void voice_afe_debug_fetch(void)
+{
+  if (s_afe_handle == NULL || s_afe_data == NULL) {
+    return;
+  }
+
+  afe_fetch_result_t *result = s_afe_handle->fetch_with_delay(s_afe_data, 0);
+  if (result == NULL || result->ret_value == ESP_FAIL) {
+    return;
+  }
+
+  ++s_afe_fetch_count;
+  s_afe_last_vad_state = result->vad_state;
+  bool vad_changed = result->vad_state != s_afe_logged_vad_state;
+  bool periodic_log = (s_afe_fetch_count % VOICE_UPLOAD_AFE_LOG_INTERVAL) == 0U;
+  if (vad_changed || periodic_log) {
+    s_afe_logged_vad_state = result->vad_state;
+    ESP_LOGI(TAG,
+             "AFE debug: feed=%lu vad=%d changed=%d data_size=%d wake=%d trigger=%d volume=%.1f dB ref_avail=%u ref_rate=%lu",
+             (unsigned long)s_afe_feed_count,
+             result->vad_state,
+             vad_changed,
+             result->data_size,
+             result->wakeup_state,
+             result->trigger_channel_id,
+             result->data_volume,
+             (unsigned)voice_afe_ref_available(),
+             (unsigned long)voice_afe_ref_sample_rate());
+  }
+}
+
+static void voice_afe_debug_feed(const int16_t *mic, size_t samples)
+{
+  if (s_afe_handle == NULL || s_afe_data == NULL || s_afe_feed_buffer == NULL ||
+      mic == NULL || samples == 0) {
+    return;
+  }
+
+  size_t offset = 0;
+  while (offset < samples) {
+    size_t copy_samples = samples - offset;
+    size_t available = (size_t)s_afe_feed_chunksize - s_afe_pending_samples;
+    if (copy_samples > available) {
+      copy_samples = available;
+    }
+
+    for (size_t i = 0; i < copy_samples; ++i) {
+      size_t frame = s_afe_pending_samples + i;
+      s_afe_feed_buffer[frame * (size_t)s_afe_feed_channels] = mic[offset + i];
+      if (s_afe_feed_channels > 1) {
+        s_afe_feed_buffer[frame * (size_t)s_afe_feed_channels + 1U] =
+          voice_afe_ref_pop_sample();
+      }
+      for (int ch = 2; ch < s_afe_feed_channels; ++ch) {
+        s_afe_feed_buffer[frame * (size_t)s_afe_feed_channels + (size_t)ch] = 0;
+      }
+    }
+
+    s_afe_pending_samples += copy_samples;
+    offset += copy_samples;
+
+    if (s_afe_pending_samples < (size_t)s_afe_feed_chunksize) {
+      continue;
+    }
+
+    int feed_ret = s_afe_handle->feed(s_afe_data, s_afe_feed_buffer);
+    if (feed_ret < 0) {
+      ESP_LOGW(TAG, "AFE feed failed: %d", feed_ret);
+      s_afe_pending_samples = 0;
+      return;
+    }
+
+    ++s_afe_feed_count;
+    s_afe_pending_samples = 0;
+    voice_afe_debug_fetch();
+  }
+}
+#endif
 
 static bool wifi_is_connected(void)
 {
@@ -547,6 +1250,93 @@ static int16_t convert_mic_sample(int32_t sample)
   return (int16_t)scaled;
 }
 
+static esp_err_t read_mic_pcm_chunk(int32_t *raw,
+                                    int16_t *pcm,
+                                    size_t *samples_out,
+                                    TickType_t timeout_ticks)
+{
+  if (raw == NULL || pcm == NULL || samples_out == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  *samples_out = 0;
+
+  size_t bytes_read = 0;
+  esp_err_t ret = i2s_channel_read(s_i2s_rx_chan,
+                                   raw,
+                                   VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int32_t),
+                                   &bytes_read,
+                                   timeout_ticks);
+  if (ret == ESP_ERR_TIMEOUT || bytes_read == 0) {
+    return ESP_ERR_TIMEOUT;
+  }
+  ESP_RETURN_ON_ERROR(ret, TAG, "read INMP441 failed");
+
+  size_t samples = bytes_read / sizeof(int32_t);
+  for (size_t i = 0; i < samples; ++i) {
+    pcm[i] = convert_mic_sample(raw[i]);
+  }
+
+#if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+  voice_afe_debug_feed(pcm, samples);
+#endif
+
+  *samples_out = samples;
+  return ESP_OK;
+}
+
+static bool vad_detect_voice(const int16_t *pcm,
+                             size_t samples,
+                             uint32_t *avg_abs_out,
+                             int16_t *peak_out,
+                             int32_t *dc_out)
+{
+  if (pcm == NULL || samples == 0) {
+    if (avg_abs_out != NULL) {
+      *avg_abs_out = 0;
+    }
+    if (peak_out != NULL) {
+      *peak_out = 0;
+    }
+    if (dc_out != NULL) {
+      *dc_out = 0;
+    }
+    return false;
+  }
+
+  int64_t sum = 0;
+  for (size_t i = 0; i < samples; ++i) {
+    sum += pcm[i];
+  }
+
+  int32_t dc = (int32_t)(sum / (int64_t)samples);
+  uint64_t sum_abs = 0;
+  int16_t peak = 0;
+  for (size_t i = 0; i < samples; ++i) {
+    int32_t centered = (int32_t)pcm[i] - dc;
+    int32_t abs_sample = centered < 0 ? -centered : centered;
+    sum_abs += (uint32_t)abs_sample;
+    if (abs_sample > peak) {
+      peak = (int16_t)abs_sample;
+    }
+  }
+
+  uint32_t avg_abs = (uint32_t)(sum_abs / samples);
+  if (avg_abs_out != NULL) {
+    *avg_abs_out = avg_abs;
+  }
+  if (peak_out != NULL) {
+    *peak_out = peak;
+  }
+  if (dc_out != NULL) {
+    *dc_out = dc;
+  }
+
+  return avg_abs >= VOICE_UPLOAD_VAD_AVG_THRESHOLD &&
+         peak >= VOICE_UPLOAD_VAD_PEAK_THRESHOLD &&
+         (uint32_t)peak <= avg_abs * VOICE_UPLOAD_VAD_PEAK_AVG_RATIO_MAX;
+}
+
 static esp_err_t send_heartbeat_if_due(int64_t *last_heartbeat_us)
 {
   int64_t now = esp_timer_get_time();
@@ -560,8 +1350,9 @@ static esp_err_t send_heartbeat_if_due(int64_t *last_heartbeat_us)
   return ESP_OK;
 }
 
-static esp_err_t record_and_upload(void)
+static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
 {
+  voice_set_state(VOICE_STATE_RECORDING);
   lcd_show_user_speaking();
   s_accept_tts = false;
   esp_err_t ret = ESP_OK;
@@ -570,6 +1361,8 @@ static esp_err_t record_and_upload(void)
   int16_t *pcm = NULL;
   int64_t last_heartbeat_us = 0;
   size_t total_pcm_bytes = 0;
+  uint32_t recorded_chunks = 0;
+  uint32_t silence_chunks = 0;
 
   if (!wifi_is_connected()) {
     ESP_LOGW(TAG, "WiFi is not connected, ignore recording request");
@@ -594,28 +1387,64 @@ static esp_err_t record_and_upload(void)
   ESP_LOGI(TAG, "recording started");
   last_heartbeat_us = esp_timer_get_time();
 
-  while (key_is_pressed() && s_ws_connected) {
+  while (s_ws_connected) {
+    if (stop_mode == RECORD_STOP_BY_KEY &&
+        recorded_chunks >= VOICE_UPLOAD_BUTTON_MIN_RECORD_CHUNKS &&
+        !key_is_pressed()) {
+      break;
+    }
+
     ESP_GOTO_ON_ERROR(send_heartbeat_if_due(&last_heartbeat_us), cleanup, TAG, "heartbeat failed");
 
-    size_t bytes_read = 0;
-    ret = i2s_channel_read(s_i2s_rx_chan,
-                           raw,
-                           VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int32_t),
-                           &bytes_read,
-                           pdMS_TO_TICKS(100));
-    if (ret == ESP_ERR_TIMEOUT || bytes_read == 0) {
+    size_t samples = 0;
+    ret = read_mic_pcm_chunk(raw, pcm, &samples, pdMS_TO_TICKS(100));
+    if (ret == ESP_ERR_TIMEOUT) {
       ret = ESP_OK;
       continue;
     }
-    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "read INMP441 failed");
+    ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "read mic failed");
 
-    size_t samples = bytes_read / sizeof(int32_t);
-    for (size_t i = 0; i < samples; ++i) {
-      pcm[i] = convert_mic_sample(raw[i]);
+    if (stop_mode == RECORD_STOP_BY_SILENCE) {
+      uint32_t avg_abs = 0;
+      int16_t peak = 0;
+      int32_t dc = 0;
+      bool has_voice = vad_detect_voice(pcm, samples, &avg_abs, &peak, &dc);
+      if (has_voice) {
+        silence_chunks = 0;
+      } else if (recorded_chunks >= VOICE_UPLOAD_VAD_MIN_RECORD_CHUNKS) {
+        ++silence_chunks;
+      }
+
+      if (recorded_chunks < 5 ||
+          silence_chunks == 1 ||
+          (recorded_chunks % VOICE_UPLOAD_RECORD_VAD_LOG_INTERVAL) == 0U) {
+        ESP_LOGI(TAG,
+                 "record VAD: chunk=%lu voice=%d avg=%lu peak=%d ratio=%lu.%lu dc=%ld silence=%lu",
+                 (unsigned long)recorded_chunks,
+                 has_voice,
+                 (unsigned long)avg_abs,
+                 peak,
+                 avg_abs > 0 ? (unsigned long)((uint32_t)peak / avg_abs) : 0UL,
+                 avg_abs > 0 ? (unsigned long)(((uint32_t)peak % avg_abs) * 10U / avg_abs) : 0UL,
+                 (long)dc,
+                 (unsigned long)silence_chunks);
+      }
     }
 
     ESP_GOTO_ON_ERROR(websocket_send_bin(pcm, samples), cleanup, TAG, "send PCM failed");
     total_pcm_bytes += samples * sizeof(int16_t);
+    ++recorded_chunks;
+
+    if (stop_mode == RECORD_STOP_BY_SILENCE) {
+      if (silence_chunks >= VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS) {
+        ESP_LOGI(TAG, "stop recording after silence: chunks=%lu", (unsigned long)silence_chunks);
+        break;
+      }
+      if (recorded_chunks >= VOICE_UPLOAD_VAD_MAX_RECORD_CHUNKS) {
+        ESP_LOGW(TAG, "stop recording at max chunks: %lu", (unsigned long)recorded_chunks);
+        break;
+      }
+    }
   }
 
 cleanup:
@@ -630,28 +1459,182 @@ cleanup:
   s_accept_tts = true;
 
   ESP_LOGI(TAG,
-           "recording ended: ret=%s pcm_bytes=%u",
+           "recording ended: ret=%s pcm_bytes=%u chunks=%lu",
            esp_err_to_name(ret),
-           (unsigned)total_pcm_bytes);
+           (unsigned)total_pcm_bytes,
+           (unsigned long)recorded_chunks);
   free(raw);
   free(pcm);
+  if (ret == ESP_OK) {
+    voice_set_state(VOICE_STATE_WAITING_RESPONSE);
+    schedule_waiting_response_timeout();
+  } else {
+    voice_set_state(VOICE_STATE_IDLE);
+  }
   return ret;
+}
+
+static esp_err_t listen_for_voice_start(int32_t *raw,
+                                        int16_t *pcm,
+                                        uint32_t *voice_chunks,
+                                        uint32_t *idle_chunks,
+                                        uint32_t *debug_cooldown_chunks,
+                                        uint32_t *multinet_silence_chunks,
+                                        uint32_t *human_voice_log_cooldown_chunks)
+{
+  if (raw == NULL || pcm == NULL || voice_chunks == NULL || idle_chunks == NULL ||
+      debug_cooldown_chunks == NULL || multinet_silence_chunks == NULL ||
+      human_voice_log_cooldown_chunks == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  size_t samples = 0;
+  esp_err_t ret = read_mic_pcm_chunk(raw,
+                                     pcm,
+                                     &samples,
+                                     pdMS_TO_TICKS(VOICE_UPLOAD_IDLE_READ_TIMEOUT_MS));
+  if (ret == ESP_ERR_TIMEOUT) {
+    return ESP_OK;
+  }
+  ESP_RETURN_ON_ERROR(ret, TAG, "read idle mic failed");
+
+  uint32_t avg_abs = 0;
+  int16_t peak = 0;
+  int32_t dc = 0;
+  bool raw_has_voice = vad_detect_voice(pcm, samples, &avg_abs, &peak, &dc);
+#if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+  vad_state_t afe_vad = voice_afe_last_vad_state();
+  bool has_voice = raw_has_voice || afe_vad == VAD_SPEECH;
+#else
+  int afe_vad = -1;
+  bool has_voice = raw_has_voice;
+#endif
+  ++(*idle_chunks);
+  if (*human_voice_log_cooldown_chunks > 0) {
+    --(*human_voice_log_cooldown_chunks);
+  }
+
+  if (*debug_cooldown_chunks > 0) {
+    --(*debug_cooldown_chunks);
+    *voice_chunks = 0;
+    *multinet_silence_chunks = 0;
+    voice_multinet_reset();
+    if (!has_voice && s_voice_state == VOICE_STATE_VAD_ACTIVE) {
+      voice_set_state(VOICE_STATE_IDLE);
+    }
+    return ESP_OK;
+  }
+
+  bool wake_detected = false;
+  if (has_voice) {
+    ++(*voice_chunks);
+    *multinet_silence_chunks = 0;
+    voice_set_state(VOICE_STATE_VAD_ACTIVE);
+    if (*human_voice_log_cooldown_chunks == 0) {
+      ESP_LOGI(TAG,
+               "human voice detected: afe_vad=%d raw_voice=%d avg=%lu peak=%d ratio=%lu.%lu dc=%ld",
+               afe_vad,
+               raw_has_voice,
+               (unsigned long)avg_abs,
+               peak,
+               avg_abs > 0 ? (unsigned long)((uint32_t)peak / avg_abs) : 0UL,
+               avg_abs > 0 ? (unsigned long)(((uint32_t)peak % avg_abs) * 10U / avg_abs) : 0UL,
+               (long)dc);
+      *human_voice_log_cooldown_chunks = VOICE_UPLOAD_HUMAN_VOICE_LOG_COOLDOWN_CHUNKS;
+    }
+    wake_detected = voice_multinet_feed(pcm, samples);
+  } else {
+    if (*voice_chunks > 0 || s_mn_pending_samples > 0) {
+      ++(*multinet_silence_chunks);
+    }
+    if (*multinet_silence_chunks >= VOICE_UPLOAD_MULTINET_RESET_SILENCE_CHUNKS) {
+      voice_multinet_reset();
+      *voice_chunks = 0;
+      *multinet_silence_chunks = 0;
+      *human_voice_log_cooldown_chunks = 0;
+    }
+    if (*voice_chunks == 0 && s_voice_state == VOICE_STATE_VAD_ACTIVE) {
+      voice_set_state(VOICE_STATE_IDLE);
+    }
+  }
+
+  if (*voice_chunks < VOICE_UPLOAD_VAD_START_CHUNKS) {
+    return ESP_OK;
+  }
+
+  if (!wake_detected) {
+    return ESP_OK;
+  }
+
+#if VOICE_UPLOAD_VAD_DEBUG_ONLY
+  *voice_chunks = 0;
+  *multinet_silence_chunks = 0;
+  *debug_cooldown_chunks = VOICE_UPLOAD_VAD_DEBUG_COOLDOWN_CHUNKS;
+  voice_set_state(VOICE_STATE_IDLE);
+  return ESP_OK;
+#endif
+
+  *voice_chunks = 0;
+  *multinet_silence_chunks = 0;
+  ESP_LOGI(TAG, "begin auto record after wake phrase");
+  clear_pending_tts_audio();
+  clear_pending_tts_texts();
+  audio_stop_playback();
+
+  ret = record_and_upload(RECORD_STOP_BY_SILENCE);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "auto record/upload failed: %s", esp_err_to_name(ret));
+    voice_set_state(VOICE_STATE_IDLE);
+  }
+  return ret;
+}
+
+static void handle_button_record(void)
+{
+  s_idle_vad_paused = true;
+  voice_multinet_reset();
+
+  ESP_LOGI(TAG,
+           "button record requested: pressed=%d ws_connected=%d state=%d",
+           key_is_pressed(),
+           s_ws_connected,
+           s_voice_state);
+
+  s_accept_tts = false;
+  clear_pending_tts_audio();
+  clear_pending_tts_texts();
+  audio_stop_playback();
+
+  esp_err_t err = record_and_upload(RECORD_STOP_BY_KEY);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "record/upload failed: %s", esp_err_to_name(err));
+    voice_set_state(VOICE_STATE_IDLE);
+    vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RECONNECT_DELAY_MS));
+  }
+
+  while (key_is_pressed()) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  key_event_t stale_event = 0;
+  while (key_wait_event(&stale_event, 0)) {
+  }
+
+  s_idle_vad_paused = false;
 }
 
 static void voice_upload_task(void *arg)
 {
   (void)arg;
-  int64_t idle_last_heartbeat_us = 0;
 
   while (true) {
+    if (key_is_pressed()) {
+      handle_button_record();
+      continue;
+    }
+
     key_event_t event = 0;
     if (!key_wait_event(&event, pdMS_TO_TICKS(1000))) {
-      if (s_ws_connected) {
-        esp_err_t err = send_heartbeat_if_due(&idle_last_heartbeat_us);
-        if (err != ESP_OK) {
-          ESP_LOGW(TAG, "idle heartbeat failed: %s", esp_err_to_name(err));
-        }
-      }
       continue;
     }
 
@@ -659,19 +1642,83 @@ static void voice_upload_task(void *arg)
       continue;
     }
 
-    s_accept_tts = false;
-    clear_pending_tts_audio();
-    clear_pending_tts_texts();
-    audio_stop_playback();
+    handle_button_record();
+  }
+}
 
-    esp_err_t err = record_and_upload();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "record/upload failed: %s", esp_err_to_name(err));
-      vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RECONNECT_DELAY_MS));
+static void voice_idle_vad_task(void *arg)
+{
+  (void)arg;
+  int64_t idle_last_heartbeat_us = 0;
+  uint32_t idle_voice_chunks = 0;
+  uint32_t idle_vad_chunks = 0;
+  uint32_t idle_debug_cooldown_chunks = 0;
+  uint32_t idle_multinet_silence_chunks = 0;
+  uint32_t idle_human_voice_log_cooldown_chunks = 0;
+  int32_t *idle_raw = (int32_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int32_t));
+  int16_t *idle_pcm = (int16_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int16_t));
+  if (idle_raw == NULL || idle_pcm == NULL) {
+    ESP_LOGE(TAG, "allocate idle VAD buffers failed");
+    free(idle_raw);
+    free(idle_pcm);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  while (true) {
+    if (s_idle_vad_paused || key_is_pressed()) {
+      idle_voice_chunks = 0;
+      idle_vad_chunks = 0;
+      idle_multinet_silence_chunks = 0;
+      idle_human_voice_log_cooldown_chunks = 0;
+      voice_multinet_reset();
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
     }
 
-    while (key_is_pressed()) {
-      vTaskDelay(pdMS_TO_TICKS(20));
+    if (s_ws_connected) {
+      esp_err_t err = send_heartbeat_if_due(&idle_last_heartbeat_us);
+      if (err != ESP_OK) {
+        ESP_LOGW(TAG, "idle heartbeat failed: %s", esp_err_to_name(err));
+      }
+    }
+
+    if (audio_is_playback_active()) {
+      voice_set_state(VOICE_STATE_SPEAKING);
+      idle_voice_chunks = 0;
+      idle_vad_chunks = 0;
+      idle_multinet_silence_chunks = 0;
+      idle_human_voice_log_cooldown_chunks = 0;
+      voice_multinet_reset();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    } else if (s_voice_state == VOICE_STATE_SPEAKING) {
+      voice_set_state(VOICE_STATE_IDLE);
+    }
+
+    if (s_voice_state == VOICE_STATE_RECORDING) {
+      idle_voice_chunks = 0;
+      idle_vad_chunks = 0;
+      idle_multinet_silence_chunks = 0;
+      idle_human_voice_log_cooldown_chunks = 0;
+      voice_multinet_reset();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    if (s_voice_state != VOICE_STATE_IDLE && s_voice_state != VOICE_STATE_VAD_ACTIVE) {
+      voice_set_state(VOICE_STATE_IDLE);
+    }
+
+    esp_err_t err = listen_for_voice_start(idle_raw,
+                                           idle_pcm,
+                                           &idle_voice_chunks,
+                                           &idle_vad_chunks,
+                                           &idle_debug_cooldown_chunks,
+                                           &idle_multinet_silence_chunks,
+                                           &idle_human_voice_log_cooldown_chunks);
+    if (err != ESP_OK) {
+      vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RECONNECT_DELAY_MS));
     }
   }
 }
@@ -684,6 +1731,17 @@ esp_err_t voice_upload_init(void)
 
   ESP_RETURN_ON_ERROR(key_init(), TAG, "key init failed");
   ESP_RETURN_ON_ERROR(voice_i2s_init(), TAG, "voice I2S init failed");
+  voice_log_model_partition_probe();
+  esp_err_t sr_ret = voice_srmodel_init();
+  if (sr_ret != ESP_OK) {
+    ESP_LOGW(TAG, "SR model list disabled: %s", esp_err_to_name(sr_ret));
+  }
+#if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+  esp_err_t afe_ret = voice_afe_debug_init();
+  if (afe_ret != ESP_OK) {
+    ESP_LOGW(TAG, "AFE debug disabled: %s", esp_err_to_name(afe_ret));
+  }
+#endif
 
   BaseType_t ret = xTaskCreate(voice_upload_task,
                                "voice_upload",
@@ -692,6 +1750,14 @@ esp_err_t voice_upload_init(void)
                                VOICE_UPLOAD_TASK_PRIORITY,
                                &s_upload_task_handle);
   ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create voice upload task failed");
+
+  ret = xTaskCreate(voice_idle_vad_task,
+                    "voice_idle_vad",
+                    VOICE_UPLOAD_TASK_STACK,
+                    NULL,
+                    VOICE_UPLOAD_TASK_PRIORITY - 1,
+                    &s_idle_vad_task_handle);
+  ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create idle VAD task failed");
 
   s_initialized = true;
   ESP_LOGI(TAG, "voice upload ready: ws=%s", VOICE_UPLOAD_WS_URI);
