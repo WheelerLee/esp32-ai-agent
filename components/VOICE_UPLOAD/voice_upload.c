@@ -26,6 +26,7 @@
 #include "key.h"
 #include "lcd.h"
 #include "model_path.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "voice_upload";
 
@@ -46,8 +47,8 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_VAD_PEAK_THRESHOLD 900
 #define VOICE_UPLOAD_VAD_START_CHUNKS 3
 #define VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS 25
-#define VOICE_UPLOAD_VAD_MIN_RECORD_CHUNKS 12
-#define VOICE_UPLOAD_VAD_MAX_RECORD_CHUNKS 500
+#define VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS 157
+#define VOICE_UPLOAD_VAD_MAX_RECORD_CHUNKS 938
 #define VOICE_UPLOAD_SPEAKING_TASK_STACK 2048
 #define VOICE_UPLOAD_RESPONSE_IDLE_TIMEOUT_MS 15000
 #define VOICE_UPLOAD_VAD_DEBUG_ONLY 0
@@ -66,8 +67,6 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_MULTINET_WAKE_COMMAND_ID 1
 #define VOICE_UPLOAD_MULTINET_TIMEOUT_MS 3000
 #define VOICE_UPLOAD_MULTINET_RESET_SILENCE_CHUNKS 10
-#define VOICE_UPLOAD_BUTTON_MIN_RECORD_CHUNKS 5
-#define VOICE_UPLOAD_READY_PROMPT_RECORD_DELAY_MS 850
 #define VOICE_UPLOAD_PROMPT_NET_ERROR "/font/net_error.wav"
 #define VOICE_UPLOAD_PROMPT_NET_ERROR_AND_TRY "/font/net_error_and_try.wav"
 #define VOICE_UPLOAD_PROMPT_IM_READY "/font/im_ready.wav"
@@ -81,6 +80,7 @@ static SemaphoreHandle_t s_ws_mutex;
 static volatile bool s_ws_connected;
 static volatile bool s_accept_tts = true;
 static volatile bool s_idle_vad_paused;
+static volatile bool s_continue_after_tts;
 static bool s_ws_started;
 static bool s_initialized;
 #if VOICE_UPLOAD_AFE_DEBUG_ENABLE
@@ -838,12 +838,16 @@ static void handle_server_json(const char *json, int len)
     }
   } else if (strcmp(type->valuestring, "ai_finished") == 0) {
     ESP_LOGI(TAG, "server: %.*s", len, json);
+    if (s_ws_connected && s_voice_state != VOICE_STATE_RECORDING) {
+      s_continue_after_tts = true;
+    }
     if (!audio_is_playback_active() && s_voice_state != VOICE_STATE_RECORDING) {
       voice_set_state(VOICE_STATE_IDLE);
     }
   } else if (strcmp(type->valuestring, "error") == 0) {
     const cJSON *stage = cJSON_GetObjectItem(root, "stage");
     const cJSON *message = cJSON_GetObjectItem(root, "message");
+    s_continue_after_tts = false;
     ESP_LOGE(TAG,
              "server error: stage=%s message=%s",
              cJSON_IsString(stage) ? stage->valuestring : "?",
@@ -992,6 +996,7 @@ static void websocket_event_handler(void *handler_args,
     break;
   case WEBSOCKET_EVENT_DISCONNECTED:
     s_ws_connected = false;
+    s_continue_after_tts = false;
     clear_pending_tts_audio();
     clear_pending_tts_texts();
     clear_pending_ws_text();
@@ -1120,6 +1125,11 @@ static vad_state_t voice_afe_last_vad_state(void)
   return s_afe_last_vad_state;
 }
 
+static bool voice_afe_vad_available(void)
+{
+  return s_afe_handle != NULL && s_afe_data != NULL;
+}
+
 static void voice_afe_playback_ref_cb(const int16_t *pcm,
                                       size_t frames,
                                       int channels,
@@ -1225,6 +1235,13 @@ static esp_err_t voice_afe_debug_init(void)
            s_afe_feed_channels,
            s_afe_handle->get_fetch_chunksize(s_afe_data),
            (unsigned)s_afe_ref_ring_size);
+#if CONFIG_SR_VADN_VADNET1_MEDIUM
+  ESP_LOGI(TAG, "voice VAD source: ESP-SR AFE VADNet1 Medium");
+#elif CONFIG_SR_VADN_WEBRTC
+  ESP_LOGI(TAG, "voice VAD source: ESP-SR AFE WebRTC VAD");
+#else
+  ESP_LOGI(TAG, "voice VAD source: ESP-SR AFE VAD");
+#endif
   return ESP_OK;
 }
 
@@ -1556,6 +1573,7 @@ static esp_err_t send_heartbeat_if_due(int64_t *last_heartbeat_us)
 
 static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
 {
+  s_continue_after_tts = false;
   voice_set_state(VOICE_STATE_RECORDING);
   lcd_show_user_speaking();
   s_accept_tts = false;
@@ -1567,6 +1585,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
   size_t total_pcm_bytes = 0;
   uint32_t recorded_chunks = 0;
   uint32_t silence_chunks = 0;
+  bool speech_started = false;
 
   if (!wifi_is_connected()) {
     ESP_LOGW(TAG, "WiFi is not connected, ignore recording request");
@@ -1592,12 +1611,6 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
   last_heartbeat_us = esp_timer_get_time();
 
   while (s_ws_connected) {
-    if (stop_mode == RECORD_STOP_BY_KEY &&
-        recorded_chunks >= VOICE_UPLOAD_BUTTON_MIN_RECORD_CHUNKS &&
-        !key_is_pressed()) {
-      break;
-    }
-
     ESP_GOTO_ON_ERROR(send_heartbeat_if_due(&last_heartbeat_us), cleanup, TAG, "heartbeat failed");
 
     size_t samples = 0;
@@ -1608,24 +1621,43 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
     }
     ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "read mic failed");
 
-    if (stop_mode == RECORD_STOP_BY_SILENCE) {
+    if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
       uint32_t avg_abs = 0;
       int16_t peak = 0;
       int32_t dc = 0;
-      bool has_voice = vad_detect_voice(pcm, samples, &avg_abs, &peak, &dc);
-      if (has_voice) {
+      bool raw_has_voice = vad_detect_voice(pcm, samples, &avg_abs, &peak, &dc);
+#if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+      vad_state_t afe_vad = voice_afe_last_vad_state();
+      bool has_voice = voice_afe_vad_available() && afe_vad == VAD_SPEECH;
+#else
+      int afe_vad = -1;
+      bool has_voice = false;
+#endif
+      bool playback_active = audio_is_playback_active();
+      bool user_voice = has_voice && !playback_active;
+      if (user_voice) {
+        if (!speech_started) {
+          ESP_LOGI(TAG, "record speech started: chunk=%lu", (unsigned long)recorded_chunks);
+        }
+        speech_started = true;
         silence_chunks = 0;
-      } else if (recorded_chunks >= VOICE_UPLOAD_VAD_MIN_RECORD_CHUNKS) {
+      } else if (speech_started) {
         ++silence_chunks;
       }
 
       if (recorded_chunks < 5 ||
+          (!speech_started && recorded_chunks == VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS) ||
           silence_chunks == 1 ||
           (recorded_chunks % VOICE_UPLOAD_RECORD_VAD_LOG_INTERVAL) == 0U) {
         ESP_LOGI(TAG,
-                 "record VAD: chunk=%lu voice=%d avg=%lu peak=%d ratio=%lu.%lu dc=%ld silence=%lu",
+                 "record VAD: chunk=%lu afe_vad=%d voice=%d user_voice=%d playback=%d started=%d raw_voice=%d avg=%lu peak=%d ratio=%lu.%lu dc=%ld silence=%lu",
                  (unsigned long)recorded_chunks,
+                 afe_vad,
                  has_voice,
+                 user_voice,
+                 playback_active,
+                 speech_started,
+                 raw_has_voice,
                  (unsigned long)avg_abs,
                  peak,
                  avg_abs > 0 ? (unsigned long)((uint32_t)peak / avg_abs) : 0UL,
@@ -1639,8 +1671,14 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
     total_pcm_bytes += samples * sizeof(int16_t);
     ++recorded_chunks;
 
-    if (stop_mode == RECORD_STOP_BY_SILENCE) {
-      if (silence_chunks >= VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS) {
+    if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
+      if (!speech_started && recorded_chunks >= VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS) {
+        ESP_LOGI(TAG,
+                 "stop recording: no speech detected in %lu chunks",
+                 (unsigned long)recorded_chunks);
+        break;
+      }
+      if (speech_started && silence_chunks >= VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS) {
         ESP_LOGI(TAG, "stop recording after silence: chunks=%lu", (unsigned long)silence_chunks);
         break;
       }
@@ -1708,10 +1746,10 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
   bool raw_has_voice = vad_detect_voice(pcm, samples, &avg_abs, &peak, &dc);
 #if VOICE_UPLOAD_AFE_DEBUG_ENABLE
   vad_state_t afe_vad = voice_afe_last_vad_state();
-  bool has_voice = raw_has_voice || afe_vad == VAD_SPEECH;
+  bool has_voice = voice_afe_vad_available() && afe_vad == VAD_SPEECH;
 #else
   int afe_vad = -1;
-  bool has_voice = raw_has_voice;
+  bool has_voice = false;
 #endif
   ++(*idle_chunks);
   if (*human_voice_log_cooldown_chunks > 0) {
@@ -1795,11 +1833,9 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
   audio_stop_playback();
 
   voice_set_state(VOICE_STATE_SPEAKING);
-  esp_err_t prompt_ret = voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_IM_READY, false);
+  esp_err_t prompt_ret = voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_IM_READY, true);
   if (prompt_ret != ESP_OK) {
     ESP_LOGW(TAG, "ready prompt failed, continue recording: %s", esp_err_to_name(prompt_ret));
-  } else {
-    vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_READY_PROMPT_RECORD_DELAY_MS));
   }
 
   ret = record_and_upload(RECORD_STOP_BY_SILENCE);
@@ -1822,6 +1858,14 @@ static void handle_button_record(void)
            s_ws_connected,
            s_voice_state);
 
+  while (key_is_pressed()) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+
+  key_event_t stale_event = 0;
+  while (key_wait_event(&stale_event, 0)) {
+  }
+
   s_accept_tts = false;
   clear_pending_tts_audio();
   clear_pending_tts_texts();
@@ -1834,7 +1878,8 @@ static void handle_button_record(void)
     goto cleanup;
   }
 
-  err = record_and_upload(RECORD_STOP_BY_KEY);
+  ESP_LOGI(TAG, "button released, start recording");
+  err = record_and_upload(RECORD_STOP_BY_SILENCE);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "record/upload failed: %s", esp_err_to_name(err));
     voice_set_state(VOICE_STATE_IDLE);
@@ -1843,14 +1888,6 @@ static void handle_button_record(void)
 
 cleanup:
   s_accept_tts = true;
-  while (key_is_pressed()) {
-    vTaskDelay(pdMS_TO_TICKS(20));
-  }
-
-  key_event_t stale_event = 0;
-  while (key_wait_event(&stale_event, 0)) {
-  }
-
   s_idle_vad_paused = false;
 }
 
@@ -1927,6 +1964,23 @@ static void voice_idle_vad_task(void *arg)
       voice_set_state(VOICE_STATE_IDLE);
     }
 
+    if (s_continue_after_tts && s_voice_state == VOICE_STATE_IDLE && s_ws_connected) {
+      s_continue_after_tts = false;
+      idle_voice_chunks = 0;
+      idle_vad_chunks = 0;
+      idle_multinet_silence_chunks = 0;
+      idle_human_voice_log_cooldown_chunks = 0;
+      voice_multinet_reset();
+      ESP_LOGI(TAG, "TTS playback finished, start continuation recording");
+      esp_err_t err = record_and_upload(RECORD_STOP_BY_SILENCE);
+      if (err != ESP_OK) {
+        ESP_LOGW(TAG, "continuation record/upload failed: %s", esp_err_to_name(err));
+        voice_set_state(VOICE_STATE_IDLE);
+        vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RECONNECT_DELAY_MS));
+      }
+      continue;
+    }
+
     if (s_voice_state == VOICE_STATE_RECORDING) {
       idle_voice_chunks = 0;
       idle_vad_chunks = 0;
@@ -1975,6 +2029,11 @@ esp_err_t voice_upload_init(void)
     ESP_LOGW(TAG, "AFE debug disabled: %s", esp_err_to_name(afe_ret));
   }
 #endif
+  esp_err_t mn_ret = voice_multinet_init();
+  if (mn_ret != ESP_OK) {
+    s_mn_init_attempted = true;
+    ESP_LOGW(TAG, "MultiNet wake disabled: %s", esp_err_to_name(mn_ret));
+  }
 
   BaseType_t ret = xTaskCreate(voice_upload_task,
                                "voice_upload",

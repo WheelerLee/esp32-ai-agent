@@ -26,6 +26,7 @@ static const char *TAG = "audio";
 static i2s_chan_handle_t s_i2s_tx_chan;
 static SemaphoreHandle_t s_audio_mutex;
 static QueueHandle_t s_pcm_queue;
+static QueueHandle_t s_text_queue;
 static TaskHandle_t s_pcm_play_task_handle;
 static uint32_t s_current_sample_rate;
 static bool s_i2s_enabled;
@@ -52,6 +53,7 @@ enum {
   audio_interruptible_write_frames = 128,
   audio_mono_write_chunk_frames = 4096,
   audio_pcm_play_log_interval = 16,
+  audio_text_queue_depth = 4,
   audio_text_task_stack = 4096,
   audio_text_task_priority = 4,
 };
@@ -82,13 +84,20 @@ static char *audio_strdup(const char *text)
 
 static void audio_text_task(void *arg)
 {
-  char *text = (char *)arg;
-  audio_pcm_playback_text_cb_t cb = s_pcm_playback_text_cb;
-  if (cb != nullptr) {
-    cb(text != nullptr ? text : "");
+  (void)arg;
+
+  while (true) {
+    char *text = nullptr;
+    if (xQueueReceive(s_text_queue, &text, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+
+    audio_pcm_playback_text_cb_t cb = s_pcm_playback_text_cb;
+    if (cb != nullptr) {
+      cb(text != nullptr ? text : "");
+    }
+    free(text);
   }
-  free(text);
-  vTaskDelete(nullptr);
 }
 
 static void audio_notify_playback_text_async(const char *text)
@@ -103,14 +112,9 @@ static void audio_notify_playback_text_async(const char *text)
     return;
   }
 
-  BaseType_t task_ret = xTaskCreate(audio_text_task,
-                                    "audio_text",
-                                    audio_text_task_stack,
-                                    text_copy,
-                                    audio_text_task_priority,
-                                    nullptr);
-  if (task_ret != pdPASS) {
-    ESP_LOGW(TAG, "create playback text task failed");
+  if (s_text_queue == nullptr ||
+      xQueueSend(s_text_queue, &text_copy, 0) != pdTRUE) {
+    ESP_LOGW(TAG, "playback text queue is full");
     free(text_copy);
   }
 }
@@ -685,6 +689,20 @@ extern "C" esp_err_t audio_init(void)
 
   s_pcm_queue = xQueueCreate(audio_pcm_queue_depth, sizeof(audio_pcm_queue_item_t));
   ESP_RETURN_ON_FALSE(s_pcm_queue != nullptr, ESP_ERR_NO_MEM, TAG, "create PCM queue failed");
+
+  s_text_queue = xQueueCreate(audio_text_queue_depth, sizeof(char *));
+  ESP_RETURN_ON_FALSE(s_text_queue != nullptr, ESP_ERR_NO_MEM, TAG, "create playback text queue failed");
+
+  BaseType_t text_task_ret = xTaskCreate(audio_text_task,
+                                         "audio_text",
+                                         audio_text_task_stack,
+                                         nullptr,
+                                         audio_text_task_priority,
+                                         nullptr);
+  ESP_RETURN_ON_FALSE(text_task_ret == pdPASS,
+                      ESP_ERR_NO_MEM,
+                      TAG,
+                      "create playback text task failed");
 
   BaseType_t task_ret = xTaskCreatePinnedToCore(audio_pcm_play_task,
                                                 "audio_pcm_play",
