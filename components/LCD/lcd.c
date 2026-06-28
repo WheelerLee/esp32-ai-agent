@@ -1507,6 +1507,27 @@ void lcd_show_user_speaking(void)
   lvgl_unlock();
 }
 
+void lcd_clear_user_speaking(void)
+{
+  if (!s_lcd_ready || strcmp(s_home_question_text, "正在说话") != 0) {
+    return;
+  }
+
+  s_home_question_text[0] = '\0';
+  s_home_reply_text[0] = '\0';
+  s_home_reply_thinking = false;
+
+  lvgl_lock();
+  show_home_page();
+  if (s_home_question_label != NULL) {
+    lv_label_set_text(s_home_question_label, s_home_question_text);
+  }
+  if (s_home_reply_label != NULL) {
+    lv_label_set_text(s_home_reply_label, s_home_reply_text);
+  }
+  lvgl_unlock();
+}
+
 void lcd_show_user_question(const char *text)
 {
   if (!s_lcd_ready) {

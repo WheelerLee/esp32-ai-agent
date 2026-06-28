@@ -1597,8 +1597,6 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
   ESP_GOTO_ON_ERROR(send_heartbeat_if_due(&(int64_t){0}), cleanup, TAG, "initial heartbeat failed");
   clear_pending_tts_audio();
   clear_pending_tts_texts();
-  ESP_GOTO_ON_ERROR(websocket_send_json_type("start"), cleanup, TAG, "send start failed");
-  start_sent = true;
 
   raw = (int32_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int32_t));
   pcm = (int16_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int16_t));
@@ -1607,7 +1605,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
     goto cleanup;
   }
 
-  ESP_LOGI(TAG, "recording started");
+  ESP_LOGI(TAG, "recording armed, waiting for speech");
   last_heartbeat_us = esp_timer_get_time();
 
   while (s_ws_connected) {
@@ -1667,17 +1665,29 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
       }
     }
 
-    ESP_GOTO_ON_ERROR(websocket_send_bin(pcm, samples), cleanup, TAG, "send PCM failed");
-    total_pcm_bytes += samples * sizeof(int16_t);
     ++recorded_chunks;
 
-    if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
-      if (!speech_started && recorded_chunks >= VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS) {
+    if ((stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) &&
+        !speech_started) {
+      if (recorded_chunks >= VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS) {
         ESP_LOGI(TAG,
                  "stop recording: no speech detected in %lu chunks",
                  (unsigned long)recorded_chunks);
         break;
       }
+      continue;
+    }
+
+    if (!start_sent) {
+      ESP_GOTO_ON_ERROR(websocket_send_json_type("start"), cleanup, TAG, "send start failed");
+      start_sent = true;
+      ESP_LOGI(TAG, "recording started");
+    }
+
+    ESP_GOTO_ON_ERROR(websocket_send_bin(pcm, samples), cleanup, TAG, "send PCM failed");
+    total_pcm_bytes += samples * sizeof(int16_t);
+
+    if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
       if (speech_started && silence_chunks >= VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS) {
         ESP_LOGI(TAG, "stop recording after silence: chunks=%lu", (unsigned long)silence_chunks);
         break;
@@ -1707,10 +1717,13 @@ cleanup:
            (unsigned long)recorded_chunks);
   free(raw);
   free(pcm);
-  if (ret == ESP_OK) {
+  if (ret == ESP_OK && start_sent) {
     voice_set_state(VOICE_STATE_WAITING_RESPONSE);
     schedule_waiting_response_timeout();
   } else {
+    if (!start_sent) {
+      lcd_clear_user_speaking();
+    }
     voice_set_state(VOICE_STATE_IDLE);
   }
   return ret;

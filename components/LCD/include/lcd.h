@@ -47,6 +47,7 @@
 
 esp_err_t lcd_init(void);
 void lcd_show_user_speaking(void);
+void lcd_clear_user_speaking(void);
 void lcd_show_user_question(const char *text);
 void lcd_show_text(const char *text);
 
