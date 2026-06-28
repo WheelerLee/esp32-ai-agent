@@ -41,6 +41,7 @@ static void *s_status_changed_user_ctx;
 static void schedule_retry(void);
 static void notify_status_changed(void);
 
+// 加锁保护共享 WiFi 状态；初始化早期没有 mutex 时直接跳过。
 static void status_lock(void)
 {
   if (s_status_mutex != NULL) {
@@ -48,6 +49,7 @@ static void status_lock(void)
   }
 }
 
+// 释放共享 WiFi 状态锁。
 static void status_unlock(void)
 {
   if (s_status_mutex != NULL) {
@@ -55,6 +57,7 @@ static void status_unlock(void)
   }
 }
 
+// 通知 UI 或其他订阅者 WiFi 状态已经变化。
 static void notify_status_changed(void)
 {
   app_wifi_status_changed_cb_t cb = s_status_changed_cb;
@@ -63,9 +66,11 @@ static void notify_status_changed(void)
   }
 }
 
+// 初始化 NVS；遇到旧版本或空间不足时按 ESP-IDF 要求擦除后重试。
 static esp_err_t init_nvs(void)
 {
   esp_err_t err = nvs_flash_init();
+  // NVS 分区格式不兼容时必须擦除，否则后续读写都会失败。
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase NVS failed");
     err = nvs_flash_init();
@@ -73,6 +78,7 @@ static esp_err_t init_nvs(void)
   return err;
 }
 
+// 从指定 NVS 命名空间读取 WiFi 凭据，可选择忽略旧格式错误。
 static esp_err_t load_credentials_from_namespace(const char *namespace_name, bool ignore_schema_error)
 {
   nvs_handle_t nvs_handle;
@@ -85,12 +91,14 @@ static esp_err_t load_credentials_from_namespace(const char *namespace_name, boo
   size_t ssid_len = sizeof(s_saved_ssid);
   err = nvs_get_str(nvs_handle, APP_WIFI_NVS_KEY_SSID, s_saved_ssid, &ssid_len);
   if (err == ESP_ERR_NVS_NOT_FOUND) {
+    // 没有 SSID 表示没有可自动连接的网络，不属于错误。
     s_saved_ssid[0] = '\0';
     nvs_close(nvs_handle);
     return ESP_OK;
   }
   if (err != ESP_OK) {
     if (ignore_schema_error) {
+      // 旧命名空间可能存过实验数据，迁移时忽略这类结构错误。
       s_saved_ssid[0] = '\0';
       nvs_close(nvs_handle);
       return ESP_OK;
@@ -102,6 +110,7 @@ static esp_err_t load_credentials_from_namespace(const char *namespace_name, boo
   size_t password_len = sizeof(s_saved_password);
   err = nvs_get_str(nvs_handle, APP_WIFI_NVS_KEY_PASSWORD, s_saved_password, &password_len);
   if (err == ESP_ERR_NVS_NOT_FOUND) {
+    // 开放网络没有密码，按空密码处理。
     s_saved_password[0] = '\0';
     err = ESP_OK;
   } else if (err != ESP_OK && ignore_schema_error) {
@@ -115,6 +124,7 @@ static esp_err_t load_credentials_from_namespace(const char *namespace_name, boo
   return ESP_OK;
 }
 
+// 保存 WiFi 凭据，并同步更新内存中的自动重连凭据。
 static esp_err_t save_credentials(const char *ssid, const char *password)
 {
   nvs_handle_t nvs_handle;
@@ -138,6 +148,7 @@ static esp_err_t save_credentials(const char *ssid, const char *password)
   return ESP_OK;
 }
 
+// 读取当前命名空间凭据；如果没有，则尝试迁移旧命名空间。
 static esp_err_t load_saved_credentials(void)
 {
   ESP_RETURN_ON_ERROR(load_credentials_from_namespace(APP_WIFI_NVS_NAMESPACE, false),
@@ -154,6 +165,7 @@ static esp_err_t load_saved_credentials(void)
   if (s_saved_ssid[0] != '\0') {
     char migrated_ssid[APP_WIFI_SSID_MAX_LEN + 1];
     char migrated_password[APP_WIFI_PASSWORD_MAX_LEN + 1];
+    // save_credentials 会改写全局缓存，所以先复制一份待迁移内容。
     strlcpy(migrated_ssid, s_saved_ssid, sizeof(migrated_ssid));
     strlcpy(migrated_password, s_saved_password, sizeof(migrated_password));
     ESP_LOGI(TAG, "loaded legacy saved WiFi SSID: %s", s_saved_ssid);
@@ -164,6 +176,7 @@ static esp_err_t load_saved_credentials(void)
   return ESP_OK;
 }
 
+// 将凭据写入 WiFi STA 配置，并启动一次连接流程。
 static esp_err_t connect_with_credentials(const char *ssid,
                                           const char *password,
                                           bool save_on_success,
@@ -187,6 +200,7 @@ static esp_err_t connect_with_credentials(const char *ssid,
   notify_status_changed();
 
   if (save_on_success) {
+    // 新凭据只有在 GOT_IP 后才真正保存，避免错误密码覆盖可用配置。
     strlcpy(s_pending_ssid, ssid, sizeof(s_pending_ssid));
     strlcpy(s_pending_password, password != NULL ? password : "", sizeof(s_pending_password));
     s_pending_save = true;
@@ -197,6 +211,7 @@ static esp_err_t connect_with_credentials(const char *ssid,
   s_suppress_next_disconnect_retry = suppress_disconnect_retry;
   esp_err_t err = esp_wifi_disconnect();
   if (err != ESP_OK) {
+    // 如果没有真正触发断开流程，就不要吞掉后续真实断线事件。
     s_suppress_next_disconnect_retry = false;
   }
   if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT) {
@@ -208,12 +223,14 @@ static esp_err_t connect_with_credentials(const char *ssid,
   return ESP_OK;
 }
 
+// 延迟重连任务：避免断线瞬间立刻重试导致状态抖动。
 static void retry_task(void *arg)
 {
   (void)arg;
 
   vTaskDelay(pdMS_TO_TICKS(APP_WIFI_RETRY_DELAY_MS));
 
+  // 先清空任务句柄，失败时 schedule_retry 才能继续创建下一轮任务。
   s_retry_task_handle = NULL;
 
   if (s_saved_ssid[0] != '\0' && s_retry_count < APP_WIFI_MAX_RETRIES) {
@@ -233,9 +250,11 @@ static void retry_task(void *arg)
   vTaskDelete(NULL);
 }
 
+// 在有保存凭据且未超过次数限制时安排一次后台重连。
 static void schedule_retry(void)
 {
   if (s_saved_ssid[0] == '\0') {
+    // 没有历史凭据时无法自动重连。
     return;
   }
   if (s_retry_count >= APP_WIFI_MAX_RETRIES) {
@@ -243,6 +262,7 @@ static void schedule_retry(void)
     return;
   }
   if (s_retry_task_handle != NULL) {
+    // 已有重连任务在等待，避免重复创建。
     return;
   }
 
@@ -253,6 +273,7 @@ static void schedule_retry(void)
   }
 }
 
+// 统一处理 WiFi/IP 事件，并维护对外可读的状态快照。
 static void wifi_event_handler(void *arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
@@ -273,6 +294,7 @@ static void wifi_event_handler(void *arg,
     ESP_LOGW(TAG, "WiFi disconnected, reason=%d", event != NULL ? event->reason : -1);
 
     if (s_suppress_next_disconnect_retry) {
+      // 主动切换网络时的断开是预期行为，不要立刻重连旧网络。
       s_suppress_next_disconnect_retry = false;
     } else {
       schedule_retry();
@@ -295,6 +317,7 @@ static void wifi_event_handler(void *arg,
     s_retry_count = 0;
 
     if (s_pending_save) {
+      // DHCP 成功后才说明凭据真的可用，此时再写入 NVS。
       esp_err_t err = save_credentials(s_pending_ssid, s_pending_password);
       if (err != ESP_OK) {
         ESP_LOGE(TAG, "save connected WiFi credentials failed: %s", esp_err_to_name(err));
@@ -304,8 +327,10 @@ static void wifi_event_handler(void *arg,
   }
 }
 
+// 初始化 WiFi STA 栈，并在存在保存 SSID 时自动连接。
 esp_err_t app_wifi_init(void)
 {
+  // 多个界面入口都可能调用 WiFi 初始化，因此保持幂等。
   if (s_initialized) {
     return ESP_OK;
   }
@@ -347,6 +372,7 @@ esp_err_t app_wifi_init(void)
                       "register IP event handler failed");
 
   ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set WiFi STA mode failed");
+  // 凭据由本组件保存到 NVS，WiFi 驱动只使用 RAM 配置。
   ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "set WiFi storage failed");
   ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start WiFi failed");
 
@@ -360,6 +386,7 @@ esp_err_t app_wifi_init(void)
   return ESP_OK;
 }
 
+// 执行一次阻塞式扫描，并把 AP 信息复制到调用者缓冲区。
 esp_err_t app_wifi_scan(app_wifi_ap_record_t *aps, size_t max_aps, size_t *ap_count)
 {
   ESP_RETURN_ON_FALSE(aps != NULL && ap_count != NULL, ESP_ERR_INVALID_ARG, TAG, "bad scan args");
@@ -378,12 +405,14 @@ esp_err_t app_wifi_scan(app_wifi_ap_record_t *aps, size_t max_aps, size_t *ap_co
   uint16_t found = 0;
   ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&found), TAG, "get AP count failed");
   if (found == 0 || max_aps == 0) {
+    // 扫描为空是正常结果，保持 ap_count 为 0。
     return ESP_OK;
   }
 
   uint16_t read_count = found > max_aps ? (uint16_t)max_aps : found;
   wifi_ap_record_t records[APP_WIFI_MAX_APS] = {0};
   if (read_count > APP_WIFI_MAX_APS) {
+    // 本地临时数组固定为 APP_WIFI_MAX_APS，避免调用者传入过大导致越界。
     read_count = APP_WIFI_MAX_APS;
   }
   ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_records(&read_count, records), TAG, "get AP records failed");
@@ -397,6 +426,7 @@ esp_err_t app_wifi_scan(app_wifi_ap_record_t *aps, size_t max_aps, size_t *ap_co
   return ESP_OK;
 }
 
+// 启动用户发起的连接，并在成功后保存凭据。
 esp_err_t app_wifi_connect(const char *ssid, const char *password)
 {
   ESP_RETURN_ON_FALSE(ssid != NULL && ssid[0] != '\0', ESP_ERR_INVALID_ARG, TAG, "SSID is empty");
@@ -406,6 +436,7 @@ esp_err_t app_wifi_connect(const char *ssid, const char *password)
   return connect_with_credentials(ssid, password, true, true);
 }
 
+// 复制当前 WiFi 状态；已连接时额外刷新实时 RSSI。
 void app_wifi_get_status(app_wifi_status_t *status)
 {
   if (status == NULL) {
@@ -417,6 +448,7 @@ void app_wifi_get_status(app_wifi_status_t *status)
   status_unlock();
 
   if (status->connected) {
+    // RSSI 会随时间变化，状态快照复制后再向驱动读取最新值。
     wifi_ap_record_t ap_info = {0};
     if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
       status->rssi = ap_info.rssi;
@@ -426,6 +458,7 @@ void app_wifi_get_status(app_wifi_status_t *status)
   }
 }
 
+// 设置 WiFi 状态变化回调，LCD 使用它来刷新状态图标和文案。
 void app_wifi_set_status_changed_cb(app_wifi_status_changed_cb_t cb, void *user_ctx)
 {
   s_status_changed_cb = cb;

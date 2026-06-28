@@ -129,11 +129,13 @@ static const lv_btnmatrix_ctrl_t s_kb_ctrl_special[] = {
   LV_KEYBOARD_CTRL_BTN_FLAGS | 3, LV_KEYBOARD_CTRL_BTN_FLAGS | 3
 };
 
+// 返回当前 UI 使用的字体，外置字库加载失败时回退到内置中文字体。
 static const lv_font_t *ui_font(void)
 {
   return s_external_chinese_font != NULL ? s_external_chinese_font : &lv_font_chinese_16;
 }
 
+// 挂载字体分区并加载懒加载中文字库。
 static void load_external_font(void)
 {
   esp_vfs_spiffs_conf_t conf = {
@@ -145,6 +147,7 @@ static void load_external_font(void)
 
   esp_err_t err = esp_vfs_spiffs_register(&conf);
   if (err == ESP_ERR_INVALID_STATE) {
+    // 字体分区可能已由其他路径挂载，视为可继续使用。
     err = ESP_OK;
   }
 
@@ -165,6 +168,7 @@ static void load_external_font(void)
   }
 }
 
+// 将 16 位无符号值限制在指定范围内。
 static uint16_t clamp_u16(uint16_t value, uint16_t min_value, uint16_t max_value)
 {
   if (value < min_value) {
@@ -176,6 +180,7 @@ static uint16_t clamp_u16(uint16_t value, uint16_t min_value, uint16_t max_value
   return value;
 }
 
+// 把触摸原始坐标轴映射到屏幕逻辑坐标范围。
 static uint16_t map_touch_axis(uint16_t value,
                                uint16_t in_min,
                                uint16_t in_max,
@@ -185,6 +190,7 @@ static uint16_t map_touch_axis(uint16_t value,
   return (uint32_t)(value - in_min) * out_max / (in_max - in_min);
 }
 
+// 将 XPT2046 原始坐标按校准参数转换为 LVGL 坐标。
 static void touch_process_coordinates(esp_lcd_touch_handle_t tp,
                                       uint16_t *x,
                                       uint16_t *y,
@@ -206,6 +212,7 @@ static void touch_process_coordinates(esp_lcd_touch_handle_t tp,
     uint16_t mapped_y;
 
     if (LCD_TOUCH_SWAP_XY) {
+      // 触摸板安装方向和 LCD 横屏方向不一致时交换轴。
       mapped_x = map_touch_axis(raw_y, LCD_TOUCH_RAW_Y_MIN, LCD_TOUCH_RAW_Y_MAX, LCD_H_RES - 1);
       mapped_y = map_touch_axis(raw_x, LCD_TOUCH_RAW_X_MIN, LCD_TOUCH_RAW_X_MAX, LCD_V_RES - 1);
     } else {
@@ -214,6 +221,7 @@ static void touch_process_coordinates(esp_lcd_touch_handle_t tp,
     }
 
     if (LCD_TOUCH_MIRROR_X) {
+      // 按实际贴合方向镜像 X 轴。
       mapped_x = (LCD_H_RES - 1) - mapped_x;
     }
     if (LCD_TOUCH_MIRROR_Y) {
@@ -232,25 +240,28 @@ static void touch_process_coordinates(esp_lcd_touch_handle_t tp,
   }
 }
 
+// LVGL 异步回调：切回首页。
 static void async_show_home_page(void *arg)
 {
   (void)arg;
   show_home_page();
 }
 
+// LVGL 异步回调：打开 WiFi 列表页。
 static void async_show_wifi_page(void *arg)
 {
   (void)arg;
   show_wifi_page();
 }
 
+// LVGL 异步回调：打开指定 SSID 的连接页。
 static void async_show_wifi_connect_page(void *arg)
 {
   (void)arg;
   show_wifi_connect_page(s_selected_ssid);
 }
 
-// LVGL is not thread-safe, so all LVGL object/timer calls share this mutex.
+// LVGL 不是线程安全的，所有对象和定时器操作都必须共用这把锁。
 static void lvgl_lock(void)
 {
   if (s_lvgl_mutex != NULL) {
@@ -258,6 +269,7 @@ static void lvgl_lock(void)
   }
 }
 
+// 释放 LVGL 操作锁。
 static void lvgl_unlock(void)
 {
   if (s_lvgl_mutex != NULL) {
@@ -265,7 +277,7 @@ static void lvgl_unlock(void)
   }
 }
 
-// esp_lcd calls this after an asynchronous color transfer has finished.
+// esp_lcd 异步颜色传输完成后调用，用于通知 LVGL 刷新结束。
 static bool lcd_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
                                esp_lcd_panel_io_event_data_t *edata,
                                void *user_ctx)
@@ -279,10 +291,11 @@ static bool lcd_flush_ready_cb(esp_lcd_panel_io_handle_t panel_io,
   return false;
 }
 
+// LVGL 显示刷新回调：把脏矩形像素提交给 LCD 面板。
 static void lcd_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
   esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t)drv->user_data;
-  // LVGL uses inclusive coordinates; esp_lcd expects the end coordinate to be exclusive.
+  // LVGL 坐标右下角是闭区间，esp_lcd 绘制接口要求结束坐标为开区间。
   int x_start = area->x1;
   int x_end = area->x2 + 1;
   int y_start = area->y1;
@@ -291,13 +304,15 @@ static void lcd_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *
   esp_lcd_panel_draw_bitmap(panel_handle, x_start, y_start, x_end, y_end, color_map);
 }
 
+// 周期性推进 LVGL 内部时基。
 static void lvgl_tick_cb(void *arg)
 {
   (void)arg;
-  // Keep LVGL's internal time base moving independently of the main task.
+  // 让 LVGL 时基独立于主任务运行。
   lv_tick_inc(2);
 }
 
+// FreeRTOS 空闲钩子：统计每个 CPU 核心的空闲次数。
 static bool cpu_idle_hook(void)
 {
   int core_id = xPortGetCoreID();
@@ -307,12 +322,14 @@ static bool cpu_idle_hook(void)
   return true;
 }
 
+// 根据空闲计数增量估算 CPU 使用率。
 static uint8_t cpu_usage_from_idle_delta(uint32_t core_id, uint32_t idle_count)
 {
   uint32_t delta = idle_count - s_cpu_idle_last[core_id];
   s_cpu_idle_last[core_id] = idle_count;
 
   if (delta > s_cpu_idle_max[core_id]) {
+    // 记录观测到的最大空闲增量，作为近似 0% 使用率基线。
     s_cpu_idle_max[core_id] = delta;
   }
   if (s_cpu_idle_max[core_id] == 0) {
@@ -326,6 +343,7 @@ static uint8_t cpu_usage_from_idle_delta(uint32_t core_id, uint32_t idle_count)
   return (uint8_t)(100U - idle_percent);
 }
 
+// 刷新首页或 WiFi 页底部的 CPU 使用率标签。
 static void update_cpu_usage_label(void)
 {
   if (s_cpu_usage_label == NULL) {
@@ -340,12 +358,14 @@ static void update_cpu_usage_label(void)
   lv_label_set_text(s_cpu_usage_label, text);
 }
 
+// LVGL 定时器回调：周期刷新 CPU 使用率。
 static void cpu_usage_timer_cb(lv_timer_t *timer)
 {
   (void)timer;
   update_cpu_usage_label();
 }
 
+// 创建带统一字体和颜色的 LVGL 标签。
 static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_t *font)
 {
   lv_obj_t *label = lv_label_create(parent);
@@ -357,6 +377,7 @@ static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_
   return label;
 }
 
+// 创建 CPU 使用率标签；键盘打开时上移避免遮挡。
 static void create_cpu_usage_label(bool above_keyboard)
 {
   s_cpu_usage_label = create_label(lv_scr_act(), "CPU0 --%  CPU1 --%", ui_font());
@@ -373,6 +394,7 @@ static void create_cpu_usage_label(bool above_keyboard)
   update_cpu_usage_label();
 }
 
+// 创建统一样式的蓝色操作按钮。
 static lv_obj_t *create_button(lv_obj_t *parent,
                                const char *text,
                                lv_coord_t width,
@@ -402,6 +424,7 @@ static lv_obj_t *create_button(lv_obj_t *parent,
   return button;
 }
 
+// 创建顶部导航栏容器。
 static lv_obj_t *create_nav_bar(void)
 {
   lv_obj_t *nav = lv_obj_create(lv_scr_act());
@@ -422,6 +445,7 @@ static lv_obj_t *create_nav_bar(void)
   return nav;
 }
 
+// 创建导航栏中的文字按钮。
 static lv_obj_t *create_nav_label_button(lv_obj_t *parent,
                                          const char *text,
                                          lv_coord_t width,
@@ -456,6 +480,7 @@ static lv_obj_t *create_nav_label_button(lv_obj_t *parent,
   return button;
 }
 
+// 统一设置屏幕键盘的尺寸、颜色和按键样式。
 static void style_keyboard(lv_obj_t *keyboard)
 {
   if (keyboard == NULL) {
@@ -479,12 +504,14 @@ static void style_keyboard(lv_obj_t *keyboard)
   lv_obj_set_style_border_color(keyboard, lv_color_hex(0xcbd5e1), LV_PART_ITEMS);
 }
 
+// LVGL 异步回调：关闭屏幕键盘。
 static void async_close_keyboard(void *arg)
 {
   (void)arg;
   close_keyboard();
 }
 
+// 自定义键盘按键事件，处理大小写、删除、空格和提交。
 static void keyboard_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) {
@@ -503,6 +530,7 @@ static void keyboard_event_cb(lv_event_t *event)
   }
 
   if (strcmp(txt, "abc") == 0) {
+    // 模式切换键不向文本框输入字符。
     lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
     return;
   }
@@ -525,6 +553,7 @@ static void keyboard_event_cb(lv_event_t *event)
   }
 
   if (strcmp(txt, "OK") == 0) {
+    // OK 表示密码输入完成，触发文本框 ready 事件并收起键盘。
     lv_event_send(textarea, LV_EVENT_READY, NULL);
     lv_async_call(async_close_keyboard, NULL);
   } else if (strcmp(txt, "Enter") == 0) {
@@ -542,6 +571,7 @@ static void keyboard_event_cb(lv_event_t *event)
   }
 }
 
+// 替换 LVGL 默认键盘映射，接入本项目的紧凑键盘布局。
 static void setup_keyboard(lv_obj_t *keyboard)
 {
   if (keyboard == NULL) {
@@ -557,6 +587,7 @@ static void setup_keyboard(lv_obj_t *keyboard)
   style_keyboard(keyboard);
 }
 
+// 将 RSSI 粗略映射为 1-3 格信号强度。
 static int wifi_signal_level_from_rssi(int8_t rssi)
 {
   if (rssi >= -60) {
@@ -568,6 +599,7 @@ static int wifi_signal_level_from_rssi(int8_t rssi)
   return 1;
 }
 
+// 绘制 WiFi 图标中的三格信号柱。
 static void create_signal_bars(lv_obj_t *parent, int level, lv_color_t active_color)
 {
   static const lv_coord_t bar_heights[] = {6, 11, 16};
@@ -590,6 +622,7 @@ static void create_signal_bars(lv_obj_t *parent, int level, lv_color_t active_co
   }
 }
 
+// 根据连接状态绘制 WiFi 图标：连接中显示 spinner，未连接显示红点。
 static lv_obj_t *create_wifi_icon(lv_obj_t *parent, int level, bool connecting)
 {
   lv_obj_t *icon = lv_obj_create(parent);
@@ -605,6 +638,7 @@ static lv_obj_t *create_wifi_icon(lv_obj_t *parent, int level, bool connecting)
   lv_obj_set_style_bg_opa(icon, LV_OPA_TRANSP, 0);
 
   if (connecting) {
+    // 连接中用 spinner 表示异步流程仍在进行。
     lv_obj_t *spinner = lv_spinner_create(icon, 1000, 70);
     if (spinner != NULL) {
       lv_obj_set_size(spinner, 20, 20);
@@ -618,6 +652,7 @@ static lv_obj_t *create_wifi_icon(lv_obj_t *parent, int level, bool connecting)
   }
 
   if (level <= 0) {
+    // 无连接或无信号时显示灰色信号柱和红色标记。
     create_signal_bars(icon, 0, lv_color_hex(0x94a3b8));
 
     lv_obj_t *mark = lv_obj_create(icon);
@@ -637,6 +672,7 @@ static lv_obj_t *create_wifi_icon(lv_obj_t *parent, int level, bool connecting)
   return icon;
 }
 
+// 根据当前 WiFi 状态在指定父对象中创建图标。
 static void create_current_wifi_icon(lv_obj_t *parent)
 {
   app_wifi_status_t status = {0};
@@ -656,6 +692,7 @@ static void create_current_wifi_icon(lv_obj_t *parent)
   }
 }
 
+// 刷新首页右上角 WiFi 状态图标。
 static void update_home_wifi_icon(void)
 {
   if (s_home_wifi_button == NULL) {
@@ -666,12 +703,14 @@ static void update_home_wifi_icon(void)
   create_current_wifi_icon(s_home_wifi_button);
 }
 
+// 首页定时器回调：周期刷新 WiFi 图标。
 static void home_wifi_timer_cb(lv_timer_t *timer)
 {
   (void)timer;
   update_home_wifi_icon();
 }
 
+// 停止首页 WiFi 图标刷新定时器，并清理按钮引用。
 static void stop_home_wifi_timer(void)
 {
   if (s_home_wifi_timer != NULL) {
@@ -681,6 +720,7 @@ static void stop_home_wifi_timer(void)
   s_home_wifi_button = NULL;
 }
 
+// WiFi 状态变化回调：同步刷新首页图标和 WiFi 页面状态。
 static void wifi_status_changed_cb(void *user_ctx)
 {
   (void)user_ctx;
@@ -695,6 +735,7 @@ static void wifi_status_changed_cb(void *user_ctx)
   lvgl_unlock();
 }
 
+// 创建 WiFi 扫描结果列表行。
 static lv_obj_t *create_list_row(lv_obj_t *parent,
                                  const char *text,
                                  int signal_level,
@@ -737,6 +778,7 @@ static lv_obj_t *create_list_row(lv_obj_t *parent,
   return row;
 }
 
+// 清空当前屏幕并恢复默认背景。
 static void clear_screen(void)
 {
   lv_obj_clean(lv_scr_act());
@@ -745,12 +787,14 @@ static void clear_screen(void)
   s_cpu_usage_label = NULL;
 }
 
+// 设置当前屏幕背景色。
 static void set_screen_bg(lv_color_t color)
 {
   lv_obj_set_style_bg_color(lv_scr_act(), color, 0);
   lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
 }
 
+// 首页 WiFi 图标点击后进入 WiFi 页面。
 static void home_wifi_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -758,6 +802,7 @@ static void home_wifi_event_cb(lv_event_t *event)
   }
 }
 
+// 刷新首页音量数字。
 static void update_home_volume_label(void)
 {
   if (s_home_volume_label == NULL) {
@@ -769,6 +814,7 @@ static void update_home_volume_label(void)
   lv_label_set_text(s_home_volume_label, text);
 }
 
+// 首页音量减按钮事件。
 static void home_volume_down_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -777,6 +823,7 @@ static void home_volume_down_event_cb(lv_event_t *event)
   }
 }
 
+// 首页音量加按钮事件。
 static void home_volume_up_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -785,6 +832,7 @@ static void home_volume_up_event_cb(lv_event_t *event)
   }
 }
 
+// WiFi 页返回按钮事件。
 static void wifi_back_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -792,6 +840,7 @@ static void wifi_back_event_cb(lv_event_t *event)
   }
 }
 
+// WiFi 页刷新按钮事件。
 static void wifi_refresh_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -799,6 +848,7 @@ static void wifi_refresh_event_cb(lv_event_t *event)
   }
 }
 
+// WiFi 连接页返回按钮事件。
 static void connect_back_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -806,6 +856,7 @@ static void connect_back_event_cb(lv_event_t *event)
   }
 }
 
+// 扫描按钮事件：启动一次新的 WiFi 扫描。
 static void wifi_scan_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
@@ -813,6 +864,7 @@ static void wifi_scan_event_cb(lv_event_t *event)
   }
 }
 
+// 删除屏幕键盘并清空全局引用。
 static void close_keyboard(void)
 {
   if (s_keyboard != NULL) {
@@ -821,6 +873,7 @@ static void close_keyboard(void)
   }
 }
 
+// 密码输入框获得焦点时创建键盘。
 static void textarea_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) != LV_EVENT_FOCUSED || s_password_ta == NULL) {
@@ -837,6 +890,7 @@ static void textarea_event_cb(lv_event_t *event)
   }
 }
 
+// 后台连接任务：避免 WiFi 连接阻塞 LVGL 线程。
 static void connect_task(void *arg)
 {
   char password[65] = {0};
@@ -850,6 +904,7 @@ static void connect_task(void *arg)
   }
 
   for (int i = 0; i < 20; ++i) {
+    // 最多轮询约 10 秒，期间持续刷新页面上的连接状态。
     lvgl_lock();
     update_wifi_status_text();
     lvgl_unlock();
@@ -857,6 +912,7 @@ static void connect_task(void *arg)
     app_wifi_status_t status = {0};
     app_wifi_get_status(&status);
     if (status.connected || (!status.connecting && i > 1)) {
+      // 成功连接或已经明确失败后提前结束等待。
       break;
     }
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -868,6 +924,7 @@ static void connect_task(void *arg)
   vTaskDelete(NULL);
 }
 
+// 连接按钮事件：读取密码并创建连接任务。
 static void connect_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) != LV_EVENT_CLICKED || s_password_ta == NULL) {
@@ -886,6 +943,7 @@ static void connect_event_cb(lv_event_t *event)
   }
 }
 
+// 扫描列表行点击事件：记录 SSID 并跳转到密码输入页。
 static void ssid_event_cb(lv_event_t *event)
 {
   if (lv_event_get_code(event) != LV_EVENT_CLICKED) {
@@ -901,6 +959,7 @@ static void ssid_event_cb(lv_event_t *event)
   lv_async_call(async_show_wifi_connect_page, NULL);
 }
 
+// 根据当前 WiFi 状态刷新状态文案和图标。
 static void update_wifi_status_text(void)
 {
   if (s_wifi_status_label == NULL) {
@@ -928,6 +987,7 @@ static void update_wifi_status_text(void)
   update_wifi_status_icon();
 }
 
+// 刷新 WiFi 页面状态图标容器。
 static void update_wifi_status_icon(void)
 {
   if (s_wifi_status_icon == NULL) {
@@ -939,6 +999,7 @@ static void update_wifi_status_icon(void)
   create_current_wifi_icon(s_wifi_status_icon);
 }
 
+// 在已持有 LVGL 锁的前提下刷新扫描结果列表。
 static void show_scan_results_locked(void)
 {
   if (s_wifi_list == NULL) {
@@ -947,6 +1008,7 @@ static void show_scan_results_locked(void)
 
   lv_obj_clean(s_wifi_list);
   if (s_scan_count == 0) {
+    // 扫描成功但没有 AP 时给用户明确反馈。
     create_label(s_wifi_list, "未发现 WiFi", ui_font());
     return;
   }
@@ -971,6 +1033,7 @@ static void show_scan_results_locked(void)
   }
 }
 
+// 后台扫描任务：执行阻塞扫描并回到 LVGL 线程刷新列表。
 static void scan_task(void *arg)
 {
   (void)arg;
@@ -991,6 +1054,7 @@ static void scan_task(void *arg)
   vTaskDelete(NULL);
 }
 
+// 启动 WiFi 扫描，并先在列表区域显示加载状态。
 static void start_wifi_scan(void)
 {
   close_keyboard();
@@ -1008,10 +1072,12 @@ static void start_wifi_scan(void)
   }
 }
 
+// 构建首页：标题、WiFi 入口、对话文本、音量控制和 CPU 标签。
 static void show_home_page(void)
 {
   stop_home_wifi_timer();
   close_keyboard();
+  // 切页前清空页面对象引用，避免回调访问已删除控件。
   s_wifi_status_label = NULL;
   s_wifi_status_icon = NULL;
   s_wifi_list = NULL;
@@ -1098,6 +1164,7 @@ static void show_home_page(void)
   create_cpu_usage_label(false);
 }
 
+// 构建 WiFi 密码输入页。
 static void show_wifi_connect_page(const char *ssid)
 {
   stop_home_wifi_timer();
@@ -1163,6 +1230,7 @@ static void show_wifi_connect_page(const char *ssid)
   create_cpu_usage_label(true);
 }
 
+// 构建 WiFi 状态和扫描列表页。
 static void show_wifi_page(void)
 {
   stop_home_wifi_timer();
@@ -1223,6 +1291,7 @@ static void show_wifi_page(void)
   app_wifi_status_t status = {0};
   app_wifi_get_status(&status);
   if (status.connected || status.connecting) {
+    // 已连接或连接中时不自动扫描，只提供手动重新扫描入口。
     if (s_wifi_list != NULL) {
       create_button(s_wifi_list, "重新扫描", LCD_H_RES - 32, 36, wifi_scan_event_cb, NULL);
     }
@@ -1233,6 +1302,7 @@ static void show_wifi_page(void)
   create_cpu_usage_label(false);
 }
 
+// LVGL 触摸输入回调：读取 XPT2046 坐标并转换成按下/松开状态。
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
   esp_lcd_touch_handle_t touch_handle = (esp_lcd_touch_handle_t)drv->user_data;
@@ -1245,6 +1315,7 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
   data->continue_reading = false;
 
   if (touch_handle == NULL || esp_lcd_touch_read_data(touch_handle) != ESP_OK) {
+    // 读取失败时保持松开状态，避免产生幽灵触摸。
     return;
   }
 
@@ -1255,6 +1326,7 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
   }
 }
 
+// LVGL 主循环任务：周期执行 timer handler。
 static void lvgl_task(void *arg)
 {
   (void)arg;
@@ -1264,6 +1336,7 @@ static void lvgl_task(void *arg)
     uint32_t task_delay_ms = lv_timer_handler();
     lvgl_unlock();
     if (task_delay_ms > 20) {
+      // 限制最大休眠时间，保证 UI 交互响应。
       task_delay_ms = 20;
     }
     if (task_delay_ms < 5) {
@@ -1273,9 +1346,10 @@ static void lvgl_task(void *arg)
   }
 }
 
+// 初始化背光 GPIO，面板准备好之前保持熄灭。
 static esp_err_t lcd_backlight_init(void)
 {
-  // Keep the backlight off until the panel is initialized to avoid visible noise.
+  // 面板初始化完成前关闭背光，避免用户看到上电噪声。
   gpio_config_t bk_gpio_config = {
     .mode = GPIO_MODE_OUTPUT,
     .pin_bit_mask = 1ULL << LCD_PIN_NUM_BK_LIGHT,
@@ -1287,9 +1361,10 @@ static esp_err_t lcd_backlight_init(void)
   return ESP_OK;
 }
 
+// 初始化 SPI 总线、ILI9341 面板并打开背光。
 static esp_err_t lcd_panel_init(void)
 {
-  // Configure SPI2 on ESP32-S3 native IO_MUX pins for the display bus.
+  // 使用 ESP32-S3 原生 IO_MUX 引脚配置 SPI2 显示总线。
   spi_bus_config_t bus_config = {
     .sclk_io_num = LCD_PIN_NUM_SCLK,
     .mosi_io_num = LCD_PIN_NUM_MOSI,
@@ -1302,7 +1377,7 @@ static esp_err_t lcd_panel_init(void)
                       TAG,
                       "initialize SPI bus failed");
 
-  // Panel IO translates esp_lcd commands and pixel transfers to SPI transactions.
+  // 面板 IO 负责把 esp_lcd 命令和像素传输转换成 SPI 事务。
   esp_lcd_panel_io_handle_t io_handle = NULL;
   esp_lcd_panel_io_spi_config_t io_config = {
     .dc_gpio_num = LCD_PIN_NUM_DC,
@@ -1321,7 +1396,7 @@ static esp_err_t lcd_panel_init(void)
                       TAG,
                       "create LCD panel IO failed");
 
-  // Most 2.8 inch ILI9341 modules use BGR order; switch here if colors are wrong.
+  // 多数 2.8 寸 ILI9341 模块使用 BGR 顺序；颜色异常时可从这里调整。
   esp_lcd_panel_dev_config_t panel_config = {
     .reset_gpio_num = LCD_PIN_NUM_RST,
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
@@ -1337,7 +1412,7 @@ static esp_err_t lcd_panel_init(void)
 
   ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel_handle), TAG, "reset panel failed");
   ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel_handle), TAG, "init panel failed");
-  // Rotate the physical 240x320 panel into landscape 320x240.
+  // 将物理 240x320 屏旋转为横屏 320x240 使用。
   ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_panel_handle, LCD_SWAP_XY), TAG, "swap xy failed");
   ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_panel_handle, LCD_MIRROR_X, LCD_MIRROR_Y),
                       TAG,
@@ -1350,6 +1425,7 @@ static esp_err_t lcd_panel_init(void)
   return ESP_OK;
 }
 
+// 初始化 XPT2046 触摸控制器并注册到 LVGL 输入系统。
 static esp_err_t touch_init(void)
 {
   esp_lcd_panel_io_handle_t touch_io_handle = NULL;
@@ -1391,6 +1467,7 @@ static esp_err_t touch_init(void)
   return ESP_OK;
 }
 
+// 初始化 LVGL、显示缓冲、触摸输入、tick 定时器和 UI 任务。
 static esp_err_t lvgl_port_init(void)
 {
   lv_init();
@@ -1399,7 +1476,7 @@ static esp_err_t lvgl_port_init(void)
   s_lvgl_mutex = xSemaphoreCreateMutex();
   ESP_RETURN_ON_FALSE(s_lvgl_mutex, ESP_ERR_NO_MEM, TAG, "create LVGL mutex failed");
 
-  // Two DMA-capable partial draw buffers let LVGL render while SPI sends pixels.
+  // 两个 DMA 可访问的局部绘制缓冲，让 LVGL 渲染和 SPI 发送可以流水执行。
   size_t draw_buffer_size = LCD_H_RES * LCD_DRAW_BUF_LINES;
   lv_color_t *buf1 = heap_caps_malloc(draw_buffer_size * sizeof(lv_color_t),
                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
@@ -1409,7 +1486,7 @@ static esp_err_t lvgl_port_init(void)
 
   lv_disp_draw_buf_init(&s_disp_buf, buf1, buf2, draw_buffer_size);
 
-  // Register this ILI9341 panel as LVGL's default display.
+  // 将 ILI9341 面板注册为 LVGL 默认显示器。
   lv_disp_drv_init(&s_disp_drv);
   s_disp_drv.hor_res = LCD_H_RES;
   s_disp_drv.ver_res = LCD_V_RES;
@@ -1441,13 +1518,14 @@ static esp_err_t lvgl_port_init(void)
   s_cpu_usage_timer = lv_timer_create(cpu_usage_timer_cb, 1000, NULL);
   ESP_RETURN_ON_FALSE(s_cpu_usage_timer != NULL, ESP_ERR_NO_MEM, TAG, "create CPU usage timer failed");
 
-  // The LVGL task runs the timer handler; UI changes from other tasks must lock first.
+  // LVGL 任务负责运行定时器处理器；其他任务改 UI 前必须先加锁。
   BaseType_t ret = xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 5, &s_lvgl_task_handle);
   ESP_RETURN_ON_FALSE(ret == pdPASS, ESP_ERR_NO_MEM, TAG, "create LVGL task failed");
 
   return ESP_OK;
 }
 
+// 初始化 LCD、LVGL、WiFi 状态回调，并显示首页。
 esp_err_t lcd_init(void)
 {
   ESP_LOGI(TAG, "initialize ILI9341 on SPI2");
@@ -1467,9 +1545,11 @@ esp_err_t lcd_init(void)
   return ESP_OK;
 }
 
+// 显示助手回复文本，并结束“思考中”状态。
 void lcd_show_text(const char *text)
 {
   if (!s_lcd_ready) {
+    // LCD 尚未初始化时忽略外部显示请求。
     return;
   }
 
@@ -1485,6 +1565,7 @@ void lcd_show_text(const char *text)
   lvgl_unlock();
 }
 
+// 显示“正在说话”状态，提示正在采集用户语音。
 void lcd_show_user_speaking(void)
 {
   if (!s_lcd_ready) {
@@ -1507,9 +1588,11 @@ void lcd_show_user_speaking(void)
   lvgl_unlock();
 }
 
+// 清除“正在说话”状态；如果当前不是该状态则不改 UI。
 void lcd_clear_user_speaking(void)
 {
   if (!s_lcd_ready || strcmp(s_home_question_text, "正在说话") != 0) {
+    // 避免把已经识别出的用户问题误清空。
     return;
   }
 
@@ -1528,6 +1611,7 @@ void lcd_clear_user_speaking(void)
   lvgl_unlock();
 }
 
+// 显示识别出的用户问题，并把回复区域切换到“思考中”。
 void lcd_show_user_question(const char *text)
 {
   if (!s_lcd_ready) {

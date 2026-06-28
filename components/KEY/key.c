@@ -17,6 +17,7 @@ static TaskHandle_t s_key_task_handle;
 static volatile bool s_pressed;
 static bool s_initialized;
 
+// GPIO 中断只做最小工作：把引脚号转发给消抖任务。
 static void IRAM_ATTR key_gpio_isr_handler(void *arg)
 {
   uint32_t gpio_num = (uint32_t)arg;
@@ -31,10 +32,12 @@ static void IRAM_ATTR key_gpio_isr_handler(void *arg)
   }
 }
 
+// 在任务上下文中对按键边沿消抖，并发布稳定的按下/松开事件。
 static void key_task(void *arg)
 {
   (void)arg;
 
+  // 按键为低电平有效，因此读取到 0 表示已按下。
   bool last_pressed = gpio_get_level(KEY_GPIO_PIN) == 0;
   s_pressed = last_pressed;
 
@@ -47,6 +50,7 @@ static void key_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(KEY_DEBOUNCE_MS));
 
     bool current_pressed = gpio_get_level(KEY_GPIO_PIN) == 0;
+    // 抖动回到上一个稳定状态时，不产生新的按键事件。
     if (current_pressed == last_pressed) {
       continue;
     }
@@ -61,8 +65,10 @@ static void key_task(void *arg)
   }
 }
 
+// 初始化按键 GPIO、中断队列、消抖事件队列和后台任务。
 esp_err_t key_init(void)
 {
+  // 允许多个模块重复调用初始化，避免创建重复任务。
   if (s_initialized) {
     return ESP_OK;
   }
@@ -83,6 +89,7 @@ esp_err_t key_init(void)
   ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG, "configure key GPIO failed");
 
   esp_err_t err = gpio_install_isr_service(0);
+  // ESP-IDF 的 GPIO ISR 服务是全局单例，已安装也视为可用。
   if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
     ESP_RETURN_ON_ERROR(err, TAG, "install GPIO ISR service failed");
   }
@@ -99,13 +106,16 @@ esp_err_t key_init(void)
   return ESP_OK;
 }
 
+// 返回 key_task 最近记录的消抖状态。
 bool key_is_pressed(void)
 {
   return s_pressed;
 }
 
+// 从公开队列中接收下一个按键事件。
 bool key_wait_event(key_event_t *event, TickType_t ticks_to_wait)
 {
+  // 防止未初始化或传入空输出指针时误用队列。
   if (event == NULL || s_key_evt_queue == NULL) {
     return false;
   }

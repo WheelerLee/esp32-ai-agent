@@ -68,6 +68,7 @@ typedef struct {
   int64_t enqueue_us;
 } audio_pcm_queue_item_t;
 
+// 复制一份播放文本，便于跨任务异步传递。
 static char *audio_strdup(const char *text)
 {
   if (text == nullptr || text[0] == '\0') {
@@ -82,6 +83,7 @@ static char *audio_strdup(const char *text)
   return copy;
 }
 
+// 文本回调任务：把播放中的 TTS 文本转发给 UI。
 static void audio_text_task(void *arg)
 {
   (void)arg;
@@ -100,8 +102,10 @@ static void audio_text_task(void *arg)
   }
 }
 
+// 将播放文本异步投递到文本队列，避免音频写入任务直接操作 UI。
 static void audio_notify_playback_text_async(const char *text)
 {
+  // 没有回调或文本为空时无需通知。
   if (s_pcm_playback_text_cb == nullptr || text == nullptr || text[0] == '\0') {
     return;
   }
@@ -119,12 +123,14 @@ static void audio_notify_playback_text_async(const char *text)
   }
 }
 
+// 把正在播放的 PCM 作为参考信号送给回声消除/调试模块。
 static void audio_notify_playback_ref(const int16_t *pcm,
                                       size_t frames,
                                       int channels,
                                       uint32_t sample_rate_hz)
 {
   audio_pcm_playback_ref_cb_t cb = s_pcm_playback_ref_cb;
+  // 回调参数不完整时直接跳过，避免下游处理无效音频。
   if (cb == nullptr || pcm == nullptr || frames == 0 || channels <= 0 ||
       sample_rate_hz == 0) {
     return;
@@ -133,11 +139,13 @@ static void audio_notify_playback_ref(const int16_t *pcm,
   cb(pcm, frames, channels, sample_rate_hz);
 }
 
+// 判断当前播放项是否已经被新的停止请求作废。
 static bool audio_playback_stop_requested(uint32_t stop_generation)
 {
   return stop_generation != s_playback_stop_generation;
 }
 
+// 停止播放时关闭 I2S，防止旧 DMA 数据继续发声。
 static void audio_disable_i2s_for_stop(void)
 {
   if (!s_i2s_enabled) {
@@ -152,6 +160,7 @@ static void audio_disable_i2s_for_stop(void)
   }
 }
 
+// 释放队列项持有的 PCM 和文本内存。
 static void audio_free_pcm_queue_item(audio_pcm_queue_item_t *item)
 {
   if (item == nullptr) {
@@ -163,6 +172,7 @@ static void audio_free_pcm_queue_item(audio_pcm_queue_item_t *item)
   memset(item, 0, sizeof(*item));
 }
 
+// 将音量等级限制在有效范围内。
 static int audio_clamp_volume_level(int volume_level)
 {
   if (volume_level < audio_volume_min_level) {
@@ -174,14 +184,17 @@ static int audio_clamp_volume_level(int volume_level)
   return volume_level;
 }
 
+// 把 0-10 的音量等级换算成百分比增益。
 static int audio_level_to_percent(int volume_level)
 {
   return audio_clamp_volume_level(volume_level) * audio_volume_percent_per_level;
 }
 
+// 初始化音量配置使用的 NVS 分区。
 static esp_err_t audio_init_nvs(void)
 {
   esp_err_t err = nvs_flash_init();
+  // NVS 分区旧版本或空间不足时，需要擦除后重新初始化。
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase NVS failed");
     err = nvs_flash_init();
@@ -189,6 +202,7 @@ static esp_err_t audio_init_nvs(void)
   return err;
 }
 
+// 从 NVS 读取保存的音量等级，失败时回落到默认音量。
 static void audio_load_volume_level(void)
 {
   esp_err_t err = audio_init_nvs();
@@ -201,6 +215,7 @@ static void audio_load_volume_level(void)
   nvs_handle_t nvs_handle;
   err = nvs_open(AUDIO_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
   if (err == ESP_ERR_NVS_NOT_FOUND) {
+    // 首次启动没有保存值，使用默认音量即可。
     s_volume_level = audio_volume_default_level;
     ESP_LOGI(TAG, "no saved volume, use default: %d", s_volume_level);
     return;
@@ -227,6 +242,7 @@ static void audio_load_volume_level(void)
   ESP_LOGI(TAG, "volume level loaded: %d", s_volume_level);
 }
 
+// 将音量等级写入 NVS，供下次启动恢复。
 static void audio_save_volume_level(int volume_level)
 {
   nvs_handle_t nvs_handle;
@@ -247,6 +263,7 @@ static void audio_save_volume_level(int volume_level)
   }
 }
 
+// 计算 int16_t 绝对值，特殊处理 INT16_MIN 溢出边界。
 static int16_t audio_abs_i16(int16_t value)
 {
   if (value == INT16_MIN) {
@@ -255,6 +272,7 @@ static int16_t audio_abs_i16(int16_t value)
   return value < 0 ? -value : value;
 }
 
+// 计算 PCM 缓冲中的峰值，用于日志和削波观察。
 static int16_t audio_pcm_peak(const int16_t *pcm, size_t sample_count)
 {
   int16_t peak = 0;
@@ -267,9 +285,11 @@ static int16_t audio_pcm_peak(const int16_t *pcm, size_t sample_count)
   return peak;
 }
 
+// 按当前音量等级对 PCM 样本施加增益，并限制到 int16_t 范围。
 static void audio_apply_gain(int16_t *pcm, size_t sample_count)
 {
   int volume_percent = audio_level_to_percent(s_volume_level);
+  // 100% 音量无需遍历修改，减少播放路径开销。
   if (volume_percent == 100) {
     return;
   }
@@ -277,6 +297,7 @@ static void audio_apply_gain(int16_t *pcm, size_t sample_count)
   for (size_t i = 0; i < sample_count; ++i) {
     int32_t sample = (int32_t)pcm[i] * volume_percent / 100;
     if (sample > INT16_MAX) {
+      // 放大后超过 int16_t 时进行饱和，避免整数回绕。
       sample = INT16_MAX;
     } else if (sample < INT16_MIN) {
       sample = INT16_MIN;
@@ -285,6 +306,7 @@ static void audio_apply_gain(int16_t *pcm, size_t sample_count)
   }
 }
 
+// 打印 PCM 播放统计，帮助定位解码、音量和 I2S 写入问题。
 static void audio_log_pcm_stats(const char *prefix,
                                 size_t frame,
                                 const int16_t *pcm,
@@ -315,6 +337,7 @@ static void audio_log_pcm_stats(const char *prefix,
            (unsigned)total_http_bytes);
 }
 
+// 按目标采样率配置 I2S；采样率变化时先关闭再重配。
 static esp_err_t audio_configure_i2s(uint32_t sample_rate_hz)
 {
   if (sample_rate_hz == 0) {
@@ -322,10 +345,12 @@ static esp_err_t audio_configure_i2s(uint32_t sample_rate_hz)
   }
 
   if (s_current_sample_rate == sample_rate_hz && s_i2s_enabled) {
+    // 当前配置已经匹配，避免不必要的 I2S 重启。
     return ESP_OK;
   }
 
   if (s_i2s_enabled) {
+    // ESP-IDF 要求通道关闭后才能修改时钟和 slot 配置。
     ESP_LOGI(TAG,
              "reconfigure I2S sample rate: %lu Hz -> %lu Hz",
              (unsigned long)s_current_sample_rate,
@@ -352,6 +377,7 @@ static esp_err_t audio_configure_i2s(uint32_t sample_rate_hz)
   return ESP_OK;
 }
 
+// 将 PCM 写入 I2S；单声道会扩展成左右声道相同的立体声。
 static esp_err_t audio_write_pcm(const int16_t *pcm,
                                  size_t samples_per_channel,
                                  int channels,
@@ -367,6 +393,7 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
 
   size_t total_written = 0;
   if (channels >= 2) {
+    // 立体声数据已交织，直接分块写入 I2S。
     size_t offset = 0;
     while (offset < samples_per_channel) {
       if (audio_playback_stop_requested(stop_generation)) {
@@ -378,6 +405,7 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
 
       size_t chunk = samples_per_channel - offset;
       if (chunk > audio_interruptible_write_frames) {
+        // 小块写入可以让停止请求更快生效。
         chunk = audio_interruptible_write_frames;
       }
 
@@ -405,6 +433,7 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
       }
       if (err != ESP_OK) {
         if (err == ESP_ERR_TIMEOUT) {
+          // I2S 短暂繁忙时继续尝试，避免轻微阻塞中断播放。
           continue;
         }
         if (bytes_written_total != nullptr) {
@@ -445,6 +474,7 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
     }
 
     for (size_t i = 0; i < chunk; ++i) {
+      // 单声道样本复制到左右声道，适配 MAX98357A 的立体声 slot 配置。
       stereo[i * 2] = pcm[offset + i];
       stereo[i * 2 + 1] = pcm[offset + i];
     }
@@ -474,6 +504,7 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
     }
     if (err != ESP_OK) {
       if (err == ESP_ERR_TIMEOUT) {
+        // 写超时通常表示 DMA 还没腾出空间，继续下一轮尝试。
         continue;
       }
       free(stereo);
@@ -495,6 +526,7 @@ static esp_err_t audio_write_pcm(const int16_t *pcm,
   return ESP_OK;
 }
 
+// 在播放尾部写入短静音，帮助功放和 DMA 平滑收尾。
 static esp_err_t audio_write_tail_silence(uint32_t sample_rate_hz)
 {
   if (sample_rate_hz == 0) {
@@ -519,9 +551,11 @@ static esp_err_t audio_write_tail_silence(uint32_t sample_rate_hz)
   return ESP_OK;
 }
 
+// 队列空闲一段时间后关闭 I2S，减少空闲噪声和资源占用。
 static esp_err_t audio_stop_i2s_when_idle(void)
 {
   if (!s_i2s_enabled || s_pcm_queue == nullptr || uxQueueMessagesWaiting(s_pcm_queue) > 0) {
+    // 仍有播放任务或 I2S 未开启时不做任何处理。
     return ESP_OK;
   }
 
@@ -533,6 +567,7 @@ static esp_err_t audio_stop_i2s_when_idle(void)
   return ESP_OK;
 }
 
+// PCM 播放任务：消费队列、配置 I2S、应用音量并写入样本。
 static void audio_pcm_play_task(void *arg)
 {
   (void)arg;
@@ -542,6 +577,7 @@ static void audio_pcm_play_task(void *arg)
   while (true) {
     audio_pcm_queue_item_t item = {};
     if (xQueueReceive(s_pcm_queue, &item, pdMS_TO_TICKS(audio_i2s_idle_stop_delay_ms)) != pdTRUE) {
+      // 长时间没有新 PCM 时，写尾部静音并关闭 I2S。
       if (xSemaphoreTake(s_audio_mutex, portMAX_DELAY) == pdTRUE) {
         esp_err_t idle_ret = audio_stop_i2s_when_idle();
         if (idle_ret != ESP_OK) {
@@ -556,6 +592,7 @@ static void audio_pcm_play_task(void *arg)
     }
 
     if (item.data == nullptr || item.bytes == 0) {
+      // 防御无效队列项，确保异常数据不会进入播放链路。
       free(item.data);
       free(item.text);
       continue;
@@ -563,11 +600,13 @@ static void audio_pcm_play_task(void *arg)
 
     uint32_t stop_generation = item.playback_generation;
     if (audio_playback_stop_requested(stop_generation)) {
+      // 入队后发生过停止请求，丢弃这段旧音频。
       audio_free_pcm_queue_item(&item);
       continue;
     }
 
     if (playback_idle) {
+      // 首包稍作预缓冲，减少 TTS 分片播放时的断续感。
       vTaskDelay(pdMS_TO_TICKS(audio_start_prebuffer_ms));
     }
 
@@ -587,6 +626,7 @@ static void audio_pcm_play_task(void *arg)
     if (ret == ESP_OK) {
       audio_notify_playback_text_async(item.text);
 
+      // 播放前计算峰值，应用音量后再记录输出峰值。
       size_t sample_count = item.bytes / sizeof(int16_t);
       int16_t *pcm = (int16_t *)item.data;
       int16_t peak_before_gain = audio_pcm_peak(pcm, sample_count);
@@ -599,6 +639,7 @@ static void audio_pcm_play_task(void *arg)
       ret = audio_write_pcm(pcm, samples_per_channel, item.channels, &bytes_written, stop_generation);
       int64_t write_us = esp_timer_get_time() - write_start_us;
       if (ret == ESP_ERR_INVALID_STATE && audio_playback_stop_requested(stop_generation)) {
+        // 停止请求通过 generation 命中，立即关闭 I2S 并丢弃剩余数据。
         audio_disable_i2s_for_stop();
         playback_stopped = true;
         ESP_LOGI(TAG, "queued PCM playback stopped");
@@ -612,6 +653,7 @@ static void audio_pcm_play_task(void *arg)
         if (played_items <= 2 ||
             queued_items == 0 ||
             (played_items % audio_pcm_play_log_interval) == 0U) {
+          // 只在开头、队列尾部和固定间隔打印，避免日志淹没播放任务。
           ESP_LOGI(TAG,
                    "queued PCM played: item=%lu bytes=%u, %lu Hz, channels=%d, audio_ms=%u queue_wait=%lld ms write=%lld ms q_left=%u volume=%d/10 peak=%d peak_out=%d i2s=%u",
                    (unsigned long)played_items,
@@ -641,8 +683,10 @@ static void audio_pcm_play_task(void *arg)
   }
 }
 
+// 初始化音频输出通道、播放队列和后台任务。
 extern "C" esp_err_t audio_init(void)
 {
+  // I2S 通道已创建说明音频模块已经初始化。
   if (s_i2s_tx_chan != nullptr) {
     return ESP_OK;
   }
@@ -725,8 +769,10 @@ extern "C" esp_err_t audio_init(void)
   return ESP_OK;
 }
 
+// 停止当前播放并清空所有已排队 PCM。
 extern "C" void audio_stop_playback(void)
 {
+  // 增加 generation，让正在播放或排队的旧音频自动失效。
   ++s_playback_stop_generation;
   s_pcm_playback_active = false;
 
@@ -734,6 +780,7 @@ extern "C" void audio_stop_playback(void)
     audio_pcm_queue_item_t item = {};
     uint32_t cleared = 0;
     while (xQueueReceive(s_pcm_queue, &item, 0) == pdTRUE) {
+      // 队列里的数据已经不会播放，立即释放内存。
       audio_free_pcm_queue_item(&item);
       ++cleared;
     }
@@ -748,6 +795,7 @@ extern "C" void audio_stop_playback(void)
   }
 }
 
+// 队列播放不带文本的 PCM 数据。
 extern "C" esp_err_t audio_queue_pcm_s16le(const void *pcm,
                                            size_t bytes,
                                            uint32_t sample_rate_hz,
@@ -756,6 +804,7 @@ extern "C" esp_err_t audio_queue_pcm_s16le(const void *pcm,
   return audio_queue_pcm_s16le_with_text(pcm, bytes, sample_rate_hz, channels, nullptr);
 }
 
+// 队列播放 PCM 数据，并可携带一段文本用于播放时刷新 UI。
 extern "C" esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
                                                      size_t bytes,
                                                      uint32_t sample_rate_hz,
@@ -780,6 +829,7 @@ extern "C" esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
 
   char *text_copy = audio_strdup(text);
   if (text != nullptr && text[0] != '\0' && text_copy == nullptr) {
+    // 音频和文本需要一起入队；文本复制失败时放弃这次入队。
     free(copy);
     ESP_LOGW(TAG, "copy queued PCM text failed");
     return ESP_ERR_NO_MEM;
@@ -796,6 +846,7 @@ extern "C" esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
   };
 
   if (xQueueSend(s_pcm_queue, &item, portMAX_DELAY) != pdTRUE) {
+    // 入队失败时释放本函数申请的所有资源，避免泄漏。
     free(copy);
     free(text_copy);
     ESP_LOGW(TAG, "PCM playback queue is full");
@@ -806,6 +857,7 @@ extern "C" esp_err_t audio_queue_pcm_s16le_with_text(const void *pcm,
   return ESP_OK;
 }
 
+// 查询播放任务是否仍有活跃或排队音频。
 extern "C" bool audio_is_playback_active(void)
 {
   if (s_pcm_playback_active) {
@@ -815,21 +867,25 @@ extern "C" bool audio_is_playback_active(void)
   return s_pcm_queue != nullptr && uxQueueMessagesWaiting(s_pcm_queue) > 0;
 }
 
+// 设置 TTS 文本播放回调。
 extern "C" void audio_set_pcm_playback_text_cb(audio_pcm_playback_text_cb_t cb)
 {
   s_pcm_playback_text_cb = cb;
 }
 
+// 设置播放参考 PCM 回调。
 extern "C" void audio_set_pcm_playback_ref_cb(audio_pcm_playback_ref_cb_t cb)
 {
   s_pcm_playback_ref_cb = cb;
 }
 
+// 获取当前音量等级。
 extern "C" int audio_get_volume_level(void)
 {
   return s_volume_level;
 }
 
+// 音量加一档并保存。
 extern "C" int audio_volume_up(void)
 {
   s_volume_level = audio_clamp_volume_level(s_volume_level + 1);
@@ -838,6 +894,7 @@ extern "C" int audio_volume_up(void)
   return s_volume_level;
 }
 
+// 音量减一档并保存。
 extern "C" int audio_volume_down(void)
 {
   s_volume_level = audio_clamp_volume_level(s_volume_level - 1);
@@ -846,6 +903,7 @@ extern "C" int audio_volume_down(void)
   return s_volume_level;
 }
 
+// 播放短测试音，用于验证 I2S 和功放工作状态。
 extern "C" esp_err_t audio_play_test_tone(void)
 {
   ESP_RETURN_ON_ERROR(audio_init(), TAG, "audio init failed");
@@ -872,6 +930,7 @@ extern "C" esp_err_t audio_play_test_tone(void)
   while (written_frames < total_frames) {
     int chunk_frames = total_frames - written_frames;
     if (chunk_frames > frames_per_chunk) {
+      // 固定小块写入，便于测试音也能响应停止请求。
       chunk_frames = frames_per_chunk;
     }
 
@@ -891,6 +950,7 @@ extern "C" esp_err_t audio_play_test_tone(void)
                                           &bytes_written,
                                           stop_generation);
     if (write_ret == ESP_ERR_INVALID_STATE && audio_playback_stop_requested(stop_generation)) {
+      // 测试音播放中被打断时，立即关闭 I2S。
       audio_disable_i2s_for_stop();
       ESP_LOGI(TAG, "test tone stopped");
       return write_ret;
@@ -902,12 +962,14 @@ extern "C" esp_err_t audio_play_test_tone(void)
   return ESP_OK;
 }
 
+// 从 URL 拉取 MP3，边下载边解码播放。
 extern "C" esp_err_t audio_play_mp3_url(const char *url)
 {
   ESP_RETURN_ON_ERROR(audio_init(), TAG, "audio init failed");
   ESP_RETURN_ON_FALSE(url != nullptr && url[0] != '\0', ESP_ERR_INVALID_ARG, TAG, "empty URL");
 
   if (xSemaphoreTake(s_audio_mutex, 0) != pdTRUE) {
+    // MP3 直连播放独占音频通道，避免和队列播放同时写 I2S。
     ESP_LOGW(TAG, "audio playback is already running");
     return ESP_ERR_INVALID_STATE;
   }
@@ -956,6 +1018,7 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
 
   while (!stream_finished || input_len > 0) {
     if (!stream_finished && input_len < AUDIO_MP3_INPUT_BUFFER_BYTES / 2) {
+      // 输入缓冲低于一半时继续从 HTTP 补数据。
       int read_len = esp_http_client_read(client,
                                          (char *)input_buf + input_len,
                                          AUDIO_MP3_INPUT_BUFFER_BYTES - input_len);
@@ -965,6 +1028,7 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
         break;
       }
       if (read_len == 0) {
+        // HTTP 读到 0 表示远端流结束，剩余缓冲仍需继续解码。
         stream_finished = true;
         ESP_LOGI(TAG,
                  "HTTP stream ended: downloaded=%u bytes buffered=%u bytes",
@@ -989,11 +1053,13 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
                                                  consumed,
                                                  samples);
     if (consumed > 0) {
+      // 解码器消费掉的字节从输入缓冲头部移除。
       memmove(input_buf, input_buf + consumed, input_len - consumed);
       input_len -= consumed;
     }
 
     if (result == micro_mp3::MP3_STREAM_INFO_READY && !stream_configured) {
+      // 首次拿到 MP3 流参数后，按实际采样率配置 I2S。
       ESP_LOGI(TAG,
                "MP3 stream: %d Hz, %d channel(s), %d kbps",
                decoder.get_sample_rate(),
@@ -1010,6 +1076,7 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
     if (result == micro_mp3::MP3_NEED_MORE_DATA) {
       ++need_more_count;
       if (stream_finished) {
+        // 文件已经结束仍缺数据，说明尾部帧不完整，结束播放。
         ESP_LOGW(TAG,
                  "decoder needs more data after HTTP EOF: buffered=%u consumed=%u",
                  (unsigned)input_len,
@@ -1020,6 +1087,7 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
     }
 
     if (result == micro_mp3::MP3_DECODE_ERROR) {
+      // 单帧损坏不影响后续帧，跳过继续解码。
       ++decode_error_count;
       ESP_LOGW(TAG, "skip corrupt MP3 frame");
       continue;
@@ -1047,6 +1115,7 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
       int16_t output_peak = audio_pcm_peak(pcm_buf, pcm_value_count);
 
       if (!stream_configured) {
+        // 某些流可能先产出 PCM，再显式报告流信息，这里兜底配置。
         ret = audio_configure_i2s((uint32_t)decoder.get_sample_rate());
         if (ret != ESP_OK) {
           break;
@@ -1057,6 +1126,7 @@ extern "C" esp_err_t audio_play_mp3_url(const char *url)
       size_t bytes_written = 0;
       ret = audio_write_pcm(pcm_buf, samples, channels, &bytes_written, stop_generation);
       if (ret == ESP_ERR_INVALID_STATE && audio_playback_stop_requested(stop_generation)) {
+        // 播放过程中收到停止请求，退出解码循环。
         audio_disable_i2s_for_stop();
         ESP_LOGI(TAG, "MP3 playback stopped");
         break;

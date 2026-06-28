@@ -162,9 +162,11 @@ static srmodel_list_t *s_srmodels;
 
 static esp_err_t voice_srmodel_init(void);
 
+// 切换语音状态，并递增 generation 让旧的延迟任务失效。
 static void voice_set_state(voice_state_t state)
 {
   if (s_voice_state == state) {
+    // 状态未变化时不递增 generation，避免误取消仍然有效的超时任务。
     return;
   }
 
@@ -172,12 +174,14 @@ static void voice_set_state(voice_state_t state)
   ++s_state_generation;
 }
 
+// 等待服务端回复的超时任务，超时后自动回到空闲态。
 static void waiting_response_timeout_task(void *arg)
 {
   uint32_t generation = (uint32_t)(uintptr_t)arg;
 
   vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RESPONSE_IDLE_TIMEOUT_MS));
   if (generation == s_state_generation && s_voice_state == VOICE_STATE_WAITING_RESPONSE) {
+    // generation 一致说明期间没有新的录音/播放状态切换。
     ESP_LOGW(TAG, "response timeout, return to idle");
     voice_set_state(VOICE_STATE_IDLE);
   }
@@ -185,6 +189,7 @@ static void waiting_response_timeout_task(void *arg)
   vTaskDelete(NULL);
 }
 
+// 为当前等待回复状态安排一个一次性超时检查任务。
 static void schedule_waiting_response_timeout(void)
 {
   uint32_t generation = s_state_generation;
@@ -199,6 +204,7 @@ static void schedule_waiting_response_timeout(void)
   }
 }
 
+// 复制字符串，便于在 TTS 文本槽和异步处理之间转移所有权。
 static char *voice_upload_strdup(const char *text)
 {
   if (text == NULL || text[0] == '\0') {
@@ -213,11 +219,13 @@ static char *voice_upload_strdup(const char *text)
   return copy;
 }
 
+// 从小端字节序读取 16 位整数。
 static uint16_t voice_read_le16(const uint8_t *data)
 {
   return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
 
+// 从小端字节序读取 32 位整数。
 static uint32_t voice_read_le32(const uint8_t *data)
 {
   return (uint32_t)data[0] |
@@ -226,6 +234,7 @@ static uint32_t voice_read_le32(const uint8_t *data)
          ((uint32_t)data[3] << 24);
 }
 
+// 跳过 WAV 中当前不关心的 chunk 数据。
 static esp_err_t voice_skip_file_bytes(FILE *file, uint32_t bytes)
 {
   if (bytes == 0) {
@@ -234,6 +243,7 @@ static esp_err_t voice_skip_file_bytes(FILE *file, uint32_t bytes)
   return fseek(file, (long)bytes, SEEK_CUR) == 0 ? ESP_OK : ESP_FAIL;
 }
 
+// 读取本地 WAV 提示音并投递到音频播放队列。
 static esp_err_t voice_play_wav_prompt(const char *path, bool wait_done)
 {
   FILE *file = fopen(path, "rb");
@@ -251,6 +261,7 @@ static esp_err_t voice_play_wav_prompt(const char *path, bool wait_done)
   if (fread(header, 1, sizeof(header), file) != sizeof(header) ||
       memcmp(header, "RIFF", 4) != 0 ||
       memcmp(header + 8, "WAVE", 4) != 0) {
+    // 只支持标准 RIFF/WAVE 容器。
     ret = ESP_ERR_INVALID_ARG;
     goto cleanup;
   }
@@ -264,6 +275,7 @@ static esp_err_t voice_play_wav_prompt(const char *path, bool wait_done)
 
     uint32_t chunk_size = voice_read_le32(chunk_header + 4);
     if (memcmp(chunk_header, "fmt ", 4) == 0) {
+      // fmt chunk 描述采样率、通道数和 PCM 格式。
       uint8_t fmt[16] = {0};
       if (chunk_size < sizeof(fmt) || fread(fmt, 1, sizeof(fmt), file) != sizeof(fmt)) {
         ret = ESP_ERR_INVALID_SIZE;
@@ -278,9 +290,11 @@ static esp_err_t voice_play_wav_prompt(const char *path, bool wait_done)
         goto cleanup;
       }
     } else if (memcmp(chunk_header, "data", 4) == 0) {
+      // data chunk 后面就是需要播放的 PCM 数据。
       data_bytes = chunk_size;
       break;
     } else {
+      // 其他扩展 chunk 暂不解析，直接跳过。
       ret = voice_skip_file_bytes(file, chunk_size);
       if (ret != ESP_OK) {
         goto cleanup;
@@ -288,6 +302,7 @@ static esp_err_t voice_play_wav_prompt(const char *path, bool wait_done)
     }
 
     if ((chunk_size & 1U) != 0U) {
+      // RIFF chunk 按偶数字节对齐，奇数长度后会补 1 字节。
       ret = voice_skip_file_bytes(file, 1);
       if (ret != ESP_OK) {
         goto cleanup;
@@ -301,6 +316,7 @@ static esp_err_t voice_play_wav_prompt(const char *path, bool wait_done)
       bits_per_sample != 16 ||
       data_bytes == 0 ||
       (data_bytes % (sizeof(int16_t) * channels)) != 0) {
+    // 播放队列只接受 16-bit PCM，其他 WAV 编码不在这里转换。
     ESP_LOGW(TAG,
              "unsupported prompt WAV: path=%s format=%u channels=%u rate=%lu bits=%u bytes=%lu",
              path,
@@ -337,6 +353,7 @@ static esp_err_t voice_play_wav_prompt(const char *path, bool wait_done)
            wait_done);
 
   if (wait_done) {
+    // 提示音需要串行播放时，按音频时长估算等待上限。
     size_t frames = data_bytes / (sizeof(int16_t) * channels);
     int64_t deadline = esp_timer_get_time() +
                        ((int64_t)frames * 1000000 / sample_rate_hz) +
@@ -355,6 +372,7 @@ cleanup:
   return ret;
 }
 
+// 清空 MultiNet 内部状态和本地待处理样本。
 static void voice_multinet_reset(void)
 {
   if (s_mn_handle != NULL && s_mn_data != NULL && s_mn_handle->clean != NULL) {
@@ -363,9 +381,11 @@ static void voice_multinet_reset(void)
   s_mn_pending_samples = 0;
 }
 
+// 初始化 MultiNet 命令词识别模型和输入缓冲。
 static esp_err_t voice_multinet_init(void)
 {
   if (s_mn_ready) {
+    // 模型只需初始化一次，后续录音流程复用。
     return ESP_OK;
   }
 
@@ -442,9 +462,11 @@ static esp_err_t voice_multinet_init(void)
   return ESP_OK;
 }
 
+// 向 MultiNet 喂入麦克风 PCM，并在检测到唤醒短语时返回 true。
 static bool voice_multinet_feed(const int16_t *pcm, size_t samples)
 {
   if (!s_mn_ready && !s_mn_init_attempted) {
+    // 首次有音频进入时再尝试初始化，避免启动阶段模型缺失直接阻塞。
     s_mn_init_attempted = true;
     esp_err_t ret = voice_multinet_init();
     if (ret != ESP_OK) {
@@ -455,6 +477,7 @@ static bool voice_multinet_feed(const int16_t *pcm, size_t samples)
 
   if (!s_mn_ready || s_mn_handle == NULL || s_mn_data == NULL || s_mn_feed_buffer == NULL ||
       pcm == NULL || samples == 0) {
+    // 模型不可用时静默跳过，录音上传仍可继续工作。
     return false;
   }
 
@@ -473,6 +496,7 @@ static bool voice_multinet_feed(const int16_t *pcm, size_t samples)
     offset += copy_samples;
 
     if (s_mn_pending_samples < (size_t)s_mn_feed_chunksize) {
+      // MultiNet 需要固定 chunk 大小，样本不足时先累积。
       continue;
     }
 
@@ -483,6 +507,7 @@ static bool voice_multinet_feed(const int16_t *pcm, size_t samples)
     }
 
     if (state == ESP_MN_STATE_TIMEOUT) {
+      // 模型超时后清理内部上下文，等待下一轮命令词。
       voice_multinet_reset();
       continue;
     }
@@ -511,6 +536,7 @@ static bool voice_multinet_feed(const int16_t *pcm, size_t samples)
 
     for (int i = 0; i < results->num && i < ESP_MN_RESULT_MAX_NUM; ++i) {
       if (results->command_id[i] == VOICE_UPLOAD_MULTINET_WAKE_COMMAND_ID) {
+        // 只把配置的唤醒命令作为开始录音的触发条件。
         ESP_LOGI(TAG,
                  "wake phrase detected: phrase=%s command=%s prob=%d.%03d text=%s raw=%s",
                  VOICE_UPLOAD_MULTINET_WAKE_DISPLAY,
@@ -530,6 +556,7 @@ static bool voice_multinet_feed(const int16_t *pcm, size_t samples)
   return false;
 }
 
+// 读取模型分区头部，辅助判断语音模型是否烧录正确。
 static void voice_log_model_partition_probe(void)
 {
   const esp_partition_t *partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
@@ -562,9 +589,11 @@ static void voice_log_model_partition_probe(void)
            header[3]);
 }
 
+// 初始化 ESP-SR 模型列表，并确认 MultiNet 模型存在。
 static esp_err_t voice_srmodel_init(void)
 {
   if (s_srmodels != NULL) {
+    // 模型列表是全局资源，重复调用直接复用。
     return ESP_OK;
   }
 
@@ -597,6 +626,7 @@ static esp_err_t voice_srmodel_init(void)
   return ESP_OK;
 }
 
+// 控制 TTS 分片日志频率，首包、周期包和带文本包一定打印。
 static bool should_log_tts_chunk(int chunk_index, const char *text)
 {
   return chunk_index <= 1 ||
@@ -604,6 +634,7 @@ static bool should_log_tts_chunk(int chunk_index, const char *text)
          (text != NULL && text[0] != '\0');
 }
 
+// 清理当前正在接收的 TTS 音频缓冲。
 static void clear_pending_tts_audio(void)
 {
   free(s_tts_audio_rx.data);
@@ -611,6 +642,7 @@ static void clear_pending_tts_audio(void)
   memset(&s_tts_audio_rx, 0, sizeof(s_tts_audio_rx));
 }
 
+// 清理一个 TTS 文本槽。
 static void clear_tts_text_slot(tts_text_slot_t *slot)
 {
   if (slot == NULL) {
@@ -621,6 +653,7 @@ static void clear_tts_text_slot(tts_text_slot_t *slot)
   memset(slot, 0, sizeof(*slot));
 }
 
+// 清理所有尚未匹配到音频的 TTS 文本。
 static void clear_pending_tts_texts(void)
 {
   for (size_t i = 0; i < VOICE_UPLOAD_TTS_TEXT_SLOTS; ++i) {
@@ -628,12 +661,14 @@ static void clear_pending_tts_texts(void)
   }
 }
 
+// 清理正在接收的 WebSocket 分片文本。
 static void clear_pending_ws_text(void)
 {
   free(s_ws_text_rx.data);
   memset(&s_ws_text_rx, 0, sizeof(s_ws_text_rx));
 }
 
+// 判断文本槽是否匹配指定回复和语音序号。
 static bool tts_ids_match(const tts_text_slot_t *slot, int response_id, int speech_index)
 {
   return slot != NULL &&
@@ -642,9 +677,11 @@ static bool tts_ids_match(const tts_text_slot_t *slot, int response_id, int spee
          slot->speech_index == speech_index;
 }
 
+// 记住服务端提前发来的 TTS 文本，等待对应音频分片到达。
 static void remember_tts_text(int response_id, int speech_index, const char *text)
 {
   if (response_id < 0 || speech_index < 0 || text == NULL || text[0] == '\0') {
+    // 没有可匹配 ID 或文本为空时不占用槽位。
     return;
   }
 
@@ -670,6 +707,7 @@ static void remember_tts_text(int response_id, int speech_index, const char *tex
     }
   }
   if (slot == NULL) {
+    // 槽位满时覆盖最旧的第 0 槽，避免无限增长。
     slot = &s_tts_text_slots[0];
   }
 
@@ -680,6 +718,7 @@ static void remember_tts_text(int response_id, int speech_index, const char *tex
   slot->text = copy;
 }
 
+// 取出并释放与 TTS 音频匹配的文本所有权。
 static char *take_tts_text(int response_id, int speech_index)
 {
   for (size_t i = 0; i < VOICE_UPLOAD_TTS_TEXT_SLOTS; ++i) {
@@ -697,9 +736,11 @@ static char *take_tts_text(int response_id, int speech_index)
   return NULL;
 }
 
+// 处理服务端 TTS 文本开始事件，记录文本等待后续音频匹配。
 static void handle_tts_start_json(const cJSON *root)
 {
   if (!s_accept_tts) {
+    // 新一轮录音已经开始时，丢弃旧回复的 TTS 文本。
     ESP_LOGI(TAG, "drop TTS start while new task is recording");
     return;
   }
@@ -718,6 +759,7 @@ static void handle_tts_start_json(const cJSON *root)
   remember_tts_text(response_id->valueint, speech_index->valueint, text->valuestring);
 }
 
+// 处理 ASR 识别结果，并把用户问题显示到 LCD。
 static void handle_asr_result_json(const cJSON *root)
 {
   const cJSON *text = cJSON_GetObjectItem(root, "text");
@@ -730,9 +772,11 @@ static void handle_asr_result_json(const cJSON *root)
   lcd_show_user_question(text->valuestring);
 }
 
+// 处理 TTS 音频元数据，为随后到来的二进制 PCM 分配缓冲。
 static void handle_tts_audio_json(const cJSON *root)
 {
   if (!s_accept_tts) {
+    // 录音优先级高于旧回复播放，避免新问题和旧回答交叉。
     ESP_LOGI(TAG, "drop TTS audio metadata while new task is recording");
     return;
   }
@@ -754,6 +798,7 @@ static void handle_tts_audio_json(const cJSON *root)
   }
 
   if (strcmp(format->valuestring, "pcm_s16le") != 0) {
+    // 播放模块目前只接收 PCM S16LE。
     ESP_LOGW(TAG, "unsupported TTS PCM format: %s", format->valuestring);
     return;
   }
@@ -769,6 +814,7 @@ static void handle_tts_audio_json(const cJSON *root)
   }
 
   clear_pending_tts_audio();
+  // 元数据和二进制帧分离，先按声明长度准备接收缓冲。
   s_tts_audio_rx.data = (uint8_t *)malloc((size_t)bytes->valueint);
   if (s_tts_audio_rx.data == NULL) {
     ESP_LOGE(TAG, "allocate TTS PCM buffer failed: %d bytes", bytes->valueint);
@@ -783,6 +829,7 @@ static void handle_tts_audio_json(const cJSON *root)
   s_tts_audio_rx.speech_index = cJSON_IsNumber(speech_index) ? speech_index->valueint : -1;
   s_tts_audio_rx.chunk_index = cJSON_IsNumber(chunk_index) ? chunk_index->valueint : -1;
   s_tts_audio_rx.meta_us = esp_timer_get_time();
+  // 通过 responseId + speechIndex 把提前收到的文本和音频配对。
   s_tts_audio_rx.text = take_tts_text(s_tts_audio_rx.response_id, s_tts_audio_rx.speech_index);
 
   if (should_log_tts_chunk(s_tts_audio_rx.chunk_index, s_tts_audio_rx.text)) {
@@ -798,6 +845,7 @@ static void handle_tts_audio_json(const cJSON *root)
   }
 }
 
+// 解析服务端 JSON 文本帧，并按 type 分发处理。
 static void handle_server_json(const char *json, int len)
 {
   char *json_copy = (char *)malloc((size_t)len + 1);
@@ -817,6 +865,7 @@ static void handle_server_json(const char *json, int len)
 
   const cJSON *type = cJSON_GetObjectItem(root, "type");
   if (!cJSON_IsString(type)) {
+    // 协议消息必须带 type，否则无法分发。
     ESP_LOGW(TAG, "server JSON without type");
     cJSON_Delete(root);
     free(json_copy);
@@ -834,17 +883,20 @@ static void handle_server_json(const char *json, int len)
   } else if (strcmp(type->valuestring, "tts_finished") == 0) {
     ESP_LOGI(TAG, "server: %.*s", len, json);
     if (!audio_is_playback_active() && s_voice_state != VOICE_STATE_RECORDING) {
+      // 音频已经播完且没有新录音时，回到空闲等待下一次触发。
       voice_set_state(VOICE_STATE_IDLE);
     }
   } else if (strcmp(type->valuestring, "ai_finished") == 0) {
     ESP_LOGI(TAG, "server: %.*s", len, json);
     if (s_ws_connected && s_voice_state != VOICE_STATE_RECORDING) {
+      // AI 结束后允许 TTS 播放完成再继续监听。
       s_continue_after_tts = true;
     }
     if (!audio_is_playback_active() && s_voice_state != VOICE_STATE_RECORDING) {
       voice_set_state(VOICE_STATE_IDLE);
     }
   } else if (strcmp(type->valuestring, "error") == 0) {
+    // 服务端错误会终止当前会话，避免客户端继续等待。
     const cJSON *stage = cJSON_GetObjectItem(root, "stage");
     const cJSON *message = cJSON_GetObjectItem(root, "message");
     s_continue_after_tts = false;
@@ -861,9 +913,11 @@ static void handle_server_json(const char *json, int len)
   free(json_copy);
 }
 
+// 处理服务端二进制帧，拼接完整 TTS PCM 后投递到播放队列。
 static void handle_server_binary(const uint8_t *data, int len)
 {
   if (!s_accept_tts) {
+    // 新录音开始后旧 TTS 二进制不再播放。
     if (s_tts_audio_rx.active) {
       clear_pending_tts_audio();
     }
@@ -872,6 +926,7 @@ static void handle_server_binary(const uint8_t *data, int len)
   }
 
   if (!s_tts_audio_rx.active || s_tts_audio_rx.data == NULL) {
+    // 没有收到对应元数据时，二进制帧无法解释。
     ESP_LOGW(TAG, "unexpected binary frame: %d bytes", len);
     return;
   }
@@ -882,6 +937,7 @@ static void handle_server_binary(const uint8_t *data, int len)
 
   size_t available = s_tts_audio_rx.expected_bytes - s_tts_audio_rx.received_bytes;
   if ((size_t)len > available) {
+    // 实际收到的数据超过元数据声明，说明协议状态已经错位。
     ESP_LOGW(TAG,
              "TTS PCM is larger than metadata: got=%d available=%u",
              len,
@@ -894,6 +950,7 @@ static void handle_server_binary(const uint8_t *data, int len)
   s_tts_audio_rx.received_bytes += (size_t)len;
 
   if (s_tts_audio_rx.received_bytes < s_tts_audio_rx.expected_bytes) {
+    // WebSocket 可能把一个音频块拆成多帧，未收满前继续等待。
     return;
   }
 
@@ -916,12 +973,14 @@ static void handle_server_binary(const uint8_t *data, int len)
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "queue TTS PCM failed: %s", esp_err_to_name(err));
   } else {
+    // PCM 入队成功后切到播放态，让录音逻辑暂停抢占。
     voice_set_state(VOICE_STATE_SPEAKING);
   }
 
   clear_pending_tts_audio();
 }
 
+// 处理 WebSocket 文本事件，兼容完整帧和分片帧。
 static void handle_server_text_event(const esp_websocket_event_data_t *data)
 {
   if (data == NULL || data->data_ptr == NULL || data->data_len <= 0) {
@@ -936,11 +995,13 @@ static void handle_server_text_event(const esp_websocket_event_data_t *data)
                     !data->fin;
 
   if (!fragmented) {
+    // 大多数 JSON 是完整文本帧，直接解析。
     handle_server_json((const char *)data->data_ptr, data->data_len);
     return;
   }
 
   if (!s_ws_text_rx.active || payload_offset == 0) {
+    // 新分片消息开始时按总长度分配拼接缓冲。
     clear_pending_ws_text();
     s_ws_text_rx.data = (char *)malloc(payload_len + 1U);
     if (s_ws_text_rx.data == NULL) {
@@ -954,6 +1015,7 @@ static void handle_server_text_event(const esp_websocket_event_data_t *data)
   if (!s_ws_text_rx.active ||
       payload_len != s_ws_text_rx.expected_bytes ||
       payload_offset + (size_t)data->data_len > s_ws_text_rx.expected_bytes) {
+    // offset/total 不一致时丢弃整条分片消息，避免解析脏 JSON。
     ESP_LOGW(TAG,
              "invalid fragmented WebSocket text: offset=%u len=%d total=%u expected=%u",
              (unsigned)payload_offset,
@@ -979,6 +1041,7 @@ static void handle_server_text_event(const esp_websocket_event_data_t *data)
   clear_pending_ws_text();
 }
 
+// WebSocket 事件总入口：维护连接状态并分发文本/二进制数据。
 static void websocket_event_handler(void *handler_args,
                                     esp_event_base_t base,
                                     int32_t event_id,
@@ -995,6 +1058,7 @@ static void websocket_event_handler(void *handler_args,
     ESP_LOGI(TAG, "WebSocket connected");
     break;
   case WEBSOCKET_EVENT_DISCONNECTED:
+    // 断线后清掉所有半包状态，下一次连接从干净状态开始。
     s_ws_connected = false;
     s_continue_after_tts = false;
     clear_pending_tts_audio();
@@ -1009,6 +1073,7 @@ static void websocket_event_handler(void *handler_args,
     }
     if (data->op_code == WS_TRANSPORT_OPCODES_TEXT ||
         (data->op_code == WS_TRANSPORT_OPCODES_CONT && s_ws_text_rx.active)) {
+      // continuation 根据当前接收状态判断属于文本还是二进制。
       handle_server_text_event(data);
     } else if (data->op_code == WS_TRANSPORT_OPCODES_BINARY ||
                (data->op_code == WS_TRANSPORT_OPCODES_CONT && s_tts_audio_rx.active)) {
@@ -1023,9 +1088,11 @@ static void websocket_event_handler(void *handler_args,
   }
 }
 
+// 初始化 INMP441 麦克风使用的 I2S RX 通道。
 static esp_err_t voice_i2s_init(void)
 {
   if (s_i2s_rx_chan != NULL) {
+    // RX 通道已存在时直接复用。
     return ESP_OK;
   }
 
@@ -1068,6 +1135,7 @@ static esp_err_t voice_i2s_init(void)
 }
 
 #if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+// 在临界区内向 AFE 回声参考环形缓冲写入一个样本。
 static void voice_afe_ref_push_sample_locked(int16_t sample)
 {
   if (s_afe_ref_ring == NULL || s_afe_ref_ring_size == 0) {
@@ -1079,10 +1147,12 @@ static void voice_afe_ref_push_sample_locked(int16_t sample)
   if (s_afe_ref_count < s_afe_ref_ring_size) {
     ++s_afe_ref_count;
   } else {
+    // 缓冲满时覆盖最旧样本，保证参考信号始终是最近播放内容。
     s_afe_ref_read_pos = (s_afe_ref_read_pos + 1U) % s_afe_ref_ring_size;
   }
 }
 
+// 从 AFE 回声参考环形缓冲取出一个样本。
 static int16_t voice_afe_ref_pop_sample(void)
 {
   int16_t sample = 0;
@@ -1098,6 +1168,7 @@ static int16_t voice_afe_ref_pop_sample(void)
   return sample;
 }
 
+// 获取当前可用的 AFE 参考样本数量。
 static size_t voice_afe_ref_available(void)
 {
   size_t count = 0;
@@ -1109,6 +1180,7 @@ static size_t voice_afe_ref_available(void)
   return count;
 }
 
+// 读取播放参考信号的采样率。
 static uint32_t voice_afe_ref_sample_rate(void)
 {
   uint32_t sample_rate = 0;
@@ -1120,16 +1192,19 @@ static uint32_t voice_afe_ref_sample_rate(void)
   return sample_rate;
 }
 
+// 返回最近一次 AFE VAD 状态。
 static vad_state_t voice_afe_last_vad_state(void)
 {
   return s_afe_last_vad_state;
 }
 
+// 判断 AFE VAD 是否已经初始化可用。
 static bool voice_afe_vad_available(void)
 {
   return s_afe_handle != NULL && s_afe_data != NULL;
 }
 
+// 音频播放参考回调：把扬声器 PCM 降混并重采样到麦克风采样率。
 static void voice_afe_playback_ref_cb(const int16_t *pcm,
                                       size_t frames,
                                       int channels,
@@ -1141,6 +1216,7 @@ static void voice_afe_playback_ref_cb(const int16_t *pcm,
 
   portENTER_CRITICAL(&s_afe_ref_mux);
   if (s_afe_ref_sample_rate != sample_rate_hz) {
+    // 播放采样率变化时重置重采样累加器。
     s_afe_ref_sample_rate = sample_rate_hz;
     s_afe_ref_resample_accum = 0;
   }
@@ -1148,6 +1224,7 @@ static void voice_afe_playback_ref_cb(const int16_t *pcm,
   for (size_t i = 0; i < frames; ++i) {
     int16_t sample = pcm[i * (size_t)channels];
     if (channels >= 2) {
+      // AFE 参考通道使用单声道，立体声播放先做简单平均。
       int32_t mixed = (int32_t)pcm[i * (size_t)channels] +
                       (int32_t)pcm[i * (size_t)channels + 1U];
       sample = (int16_t)(mixed / 2);
@@ -1155,6 +1232,7 @@ static void voice_afe_playback_ref_cb(const int16_t *pcm,
 
     s_afe_ref_resample_accum += VOICE_UPLOAD_SAMPLE_RATE_HZ;
     while (s_afe_ref_resample_accum >= sample_rate_hz) {
+      // 用整数累加器做轻量重采样，避免引入额外依赖。
       voice_afe_ref_push_sample_locked(sample);
       s_afe_ref_resample_accum -= sample_rate_hz;
     }
@@ -1162,9 +1240,11 @@ static void voice_afe_playback_ref_cb(const int16_t *pcm,
   portEXIT_CRITICAL(&s_afe_ref_mux);
 }
 
+// 初始化 ESP-SR AFE 调试链路，用于观察 VAD 和回声参考。
 static esp_err_t voice_afe_debug_init(void)
 {
   if (s_afe_data != NULL) {
+    // AFE 创建成本较高，只初始化一次。
     return ESP_OK;
   }
 
@@ -1185,6 +1265,7 @@ static esp_err_t voice_afe_debug_init(void)
   afe_config->se_init = false;
   afe_config->vad_init = true;
   afe_config->aec_init = true;
+  // 调试链路只关注 VAD/AEC，关闭降噪和自动增益以减少变量。
   afe_config->ns_init = false;
   afe_config->agc_init = false;
 
@@ -1245,6 +1326,7 @@ static esp_err_t voice_afe_debug_init(void)
   return ESP_OK;
 }
 
+// 拉取 AFE 处理结果并按变化或固定间隔输出调试日志。
 static void voice_afe_debug_fetch(void)
 {
   if (s_afe_handle == NULL || s_afe_data == NULL) {
@@ -1261,6 +1343,7 @@ static void voice_afe_debug_fetch(void)
   bool vad_changed = result->vad_state != s_afe_logged_vad_state;
   bool periodic_log = (s_afe_fetch_count % VOICE_UPLOAD_AFE_LOG_INTERVAL) == 0U;
   if (vad_changed || periodic_log) {
+    // 状态变化立即打印，稳定状态按间隔打印，避免日志过多。
     s_afe_logged_vad_state = result->vad_state;
     ESP_LOGI(TAG,
              "AFE debug: feed=%lu vad=%d changed=%d data_size=%d wake=%d trigger=%d volume=%.1f dB ref_avail=%u ref_rate=%lu",
@@ -1276,6 +1359,7 @@ static void voice_afe_debug_fetch(void)
   }
 }
 
+// 向 AFE 喂入麦克风样本，并补上播放参考通道。
 static void voice_afe_debug_feed(const int16_t *mic, size_t samples)
 {
   if (s_afe_handle == NULL || s_afe_data == NULL || s_afe_feed_buffer == NULL ||
@@ -1295,6 +1379,7 @@ static void voice_afe_debug_feed(const int16_t *mic, size_t samples)
       size_t frame = s_afe_pending_samples + i;
       s_afe_feed_buffer[frame * (size_t)s_afe_feed_channels] = mic[offset + i];
       if (s_afe_feed_channels > 1) {
+        // 第二通道用于 AEC 参考，没有参考样本时补 0。
         s_afe_feed_buffer[frame * (size_t)s_afe_feed_channels + 1U] =
           voice_afe_ref_pop_sample();
       }
@@ -1307,6 +1392,7 @@ static void voice_afe_debug_feed(const int16_t *mic, size_t samples)
     offset += copy_samples;
 
     if (s_afe_pending_samples < (size_t)s_afe_feed_chunksize) {
+      // AFE 同样需要固定 chunk，样本不足先累积。
       continue;
     }
 
@@ -1324,6 +1410,7 @@ static void voice_afe_debug_feed(const int16_t *mic, size_t samples)
 }
 #endif
 
+// 查询 WiFi 模块当前是否已连接。
 static bool wifi_is_connected(void)
 {
   app_wifi_status_t status = {0};
@@ -1331,6 +1418,7 @@ static bool wifi_is_connected(void)
   return status.connected;
 }
 
+// 确保 WebSocket 客户端存在且已连接。
 static esp_err_t websocket_ensure_connected(void)
 {
   if (s_ws_mutex != NULL) {
@@ -1346,6 +1434,7 @@ static esp_err_t websocket_ensure_connected(void)
 
   esp_err_t ret = ESP_OK;
   if (s_ws_client == NULL) {
+    // 首次连接时创建客户端，后续断线重连复用同一个实例。
     esp_websocket_client_config_t ws_cfg = {
       .uri = VOICE_UPLOAD_WS_URI,
       .buffer_size = VOICE_UPLOAD_WS_RX_BUFFER_BYTES,
@@ -1370,6 +1459,7 @@ static esp_err_t websocket_ensure_connected(void)
   }
 
   if (!s_ws_started) {
+    // start 是异步的，真正连上会在事件回调中设置 s_ws_connected。
     s_ws_connected = false;
     ESP_LOGI(TAG, "connecting WebSocket: %s", VOICE_UPLOAD_WS_URI);
     ret = esp_websocket_client_start(s_ws_client);
@@ -1382,6 +1472,7 @@ static esp_err_t websocket_ensure_connected(void)
 
   int64_t deadline = esp_timer_get_time() + (int64_t)VOICE_UPLOAD_CONNECT_TIMEOUT_MS * 1000;
   while (!s_ws_connected && esp_timer_get_time() < deadline) {
+    // 等待事件回调确认连接，避免发送数据时连接尚未建立。
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 
@@ -1402,6 +1493,7 @@ cleanup:
   return ret;
 }
 
+// 发送一条 WebSocket 文本消息。
 static esp_err_t websocket_send_text(const char *text)
 {
   int ret = esp_websocket_client_send_text(s_ws_client,
@@ -1411,6 +1503,7 @@ static esp_err_t websocket_send_text(const char *text)
   return ret >= 0 ? ESP_OK : ESP_FAIL;
 }
 
+// 发送只包含 type 字段的简短 JSON 控制消息。
 static esp_err_t websocket_send_json_type(const char *type)
 {
   char message[32];
@@ -1422,6 +1515,7 @@ static esp_err_t websocket_send_json_type(const char *type)
   return websocket_send_text(message);
 }
 
+// 发送一块 PCM 二进制音频数据。
 static esp_err_t websocket_send_bin(const int16_t *pcm, size_t sample_count)
 {
   int ret = esp_websocket_client_send_bin(s_ws_client,
@@ -1431,6 +1525,7 @@ static esp_err_t websocket_send_bin(const int16_t *pcm, size_t sample_count)
   return ret >= 0 ? ESP_OK : ESP_FAIL;
 }
 
+// 后台监控任务：WiFi 可用时保持 WebSocket 连接。
 static void voice_ws_monitor_task(void *arg)
 {
   (void)arg;
@@ -1440,6 +1535,7 @@ static void voice_ws_monitor_task(void *arg)
 
   while (true) {
     if (!s_ws_connected && wifi_is_connected()) {
+      // WiFi 连接后自动补建 WebSocket，减少首次录音等待。
       esp_err_t err = websocket_ensure_connected();
       if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
         ESP_LOGW(TAG, "background WebSocket connect failed: %s", esp_err_to_name(err));
@@ -1449,6 +1545,7 @@ static void voice_ws_monitor_task(void *arg)
     if (!startup_prompt_played &&
         !s_ws_connected &&
         esp_timer_get_time() >= startup_deadline) {
+      // 启动后长时间连不上服务端，播放一次网络错误提示。
       ESP_LOGW(TAG, "startup WebSocket is not connected after %d ms",
                VOICE_UPLOAD_STARTUP_WS_TIMEOUT_MS);
       voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_NET_ERROR, false);
@@ -1459,6 +1556,7 @@ static void voice_ws_monitor_task(void *arg)
   }
 }
 
+// 将 INMP441 32 位采样缩放并饱和到 16 位 PCM。
 static int16_t convert_mic_sample(int32_t sample)
 {
   int32_t scaled = sample >> VOICE_UPLOAD_MIC_SHIFT;
@@ -1471,6 +1569,7 @@ static int16_t convert_mic_sample(int32_t sample)
   return (int16_t)scaled;
 }
 
+// 从 I2S 读取一块麦克风数据，并转换成 16 位 PCM。
 static esp_err_t read_mic_pcm_chunk(int32_t *raw,
                                     int16_t *pcm,
                                     size_t *samples_out,
@@ -1489,6 +1588,7 @@ static esp_err_t read_mic_pcm_chunk(int32_t *raw,
                                    &bytes_read,
                                    timeout_ticks);
   if (ret == ESP_ERR_TIMEOUT || bytes_read == 0) {
+    // 空读不算硬错误，调用者可以继续等待下一块音频。
     return ESP_ERR_TIMEOUT;
   }
   ESP_RETURN_ON_ERROR(ret, TAG, "read INMP441 failed");
@@ -1499,6 +1599,7 @@ static esp_err_t read_mic_pcm_chunk(int32_t *raw,
   }
 
 #if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+  // 调试模式下同步喂给 AFE，观察 VAD/AEC 表现。
   voice_afe_debug_feed(pcm, samples);
 #endif
 
@@ -1506,6 +1607,7 @@ static esp_err_t read_mic_pcm_chunk(int32_t *raw,
   return ESP_OK;
 }
 
+// 简单能量 VAD：去直流后用平均绝对值、峰值和峰均比判断人声。
 static bool vad_detect_voice(const int16_t *pcm,
                              size_t samples,
                              uint32_t *avg_abs_out,
@@ -1513,6 +1615,7 @@ static bool vad_detect_voice(const int16_t *pcm,
                              int32_t *dc_out)
 {
   if (pcm == NULL || samples == 0) {
+    // 无样本时输出清零，方便调用者直接打印调试值。
     if (avg_abs_out != NULL) {
       *avg_abs_out = 0;
     }
@@ -1558,6 +1661,7 @@ static bool vad_detect_voice(const int16_t *pcm,
          (uint32_t)peak <= avg_abs * VOICE_UPLOAD_VAD_PEAK_AVG_RATIO_MAX;
 }
 
+// 到达心跳间隔时向服务端发送 ping。
 static esp_err_t send_heartbeat_if_due(int64_t *last_heartbeat_us)
 {
   int64_t now = esp_timer_get_time();
@@ -1571,8 +1675,10 @@ static esp_err_t send_heartbeat_if_due(int64_t *last_heartbeat_us)
   return ESP_OK;
 }
 
+// 录音并上传到服务端，按 stop_mode 决定停止条件。
 static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
 {
+  // 新录音开始后，旧回复的 TTS 不再被接受。
   s_continue_after_tts = false;
   voice_set_state(VOICE_STATE_RECORDING);
   lcd_show_user_speaking();
@@ -1588,6 +1694,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
   bool speech_started = false;
 
   if (!wifi_is_connected()) {
+    // 无 WiFi 时直接拒绝录音，避免用户以为已经上传。
     ESP_LOGW(TAG, "WiFi is not connected, ignore recording request");
     ret = ESP_ERR_INVALID_STATE;
     goto cleanup;
@@ -1595,6 +1702,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
 
   ESP_GOTO_ON_ERROR(websocket_ensure_connected(), cleanup, TAG, "WebSocket connect failed");
   ESP_GOTO_ON_ERROR(send_heartbeat_if_due(&(int64_t){0}), cleanup, TAG, "initial heartbeat failed");
+  // 开始新请求前清空上一轮残留的 TTS 半包和文本槽。
   clear_pending_tts_audio();
   clear_pending_tts_texts();
 
@@ -1620,6 +1728,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
     ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "read mic failed");
 
     if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
+      // 静音/按键停止模式下需要实时判断是否已经开始说话。
       uint32_t avg_abs = 0;
       int16_t peak = 0;
       int32_t dc = 0;
@@ -1632,6 +1741,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
       bool has_voice = false;
 #endif
       bool playback_active = audio_is_playback_active();
+      // AFE 判定有人声且当前没有播放参考音频时，才认为是用户在说话。
       bool user_voice = has_voice && !playback_active;
       if (user_voice) {
         if (!speech_started) {
@@ -1647,6 +1757,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
           (!speech_started && recorded_chunks == VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS) ||
           silence_chunks == 1 ||
           (recorded_chunks % VOICE_UPLOAD_RECORD_VAD_LOG_INTERVAL) == 0U) {
+        // 开头、状态变化和固定间隔打印 VAD 统计，便于调阈值。
         ESP_LOGI(TAG,
                  "record VAD: chunk=%lu afe_vad=%d voice=%d user_voice=%d playback=%d started=%d raw_voice=%d avg=%lu peak=%d ratio=%lu.%lu dc=%ld silence=%lu",
                  (unsigned long)recorded_chunks,
@@ -1670,6 +1781,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
     if ((stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) &&
         !speech_started) {
       if (recorded_chunks >= VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS) {
+        // 等了一段时间仍没人声，放弃本次录音。
         ESP_LOGI(TAG,
                  "stop recording: no speech detected in %lu chunks",
                  (unsigned long)recorded_chunks);
@@ -1679,6 +1791,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
     }
 
     if (!start_sent) {
+      // 只有检测到真实语音后才发 start，避免服务端收到空请求。
       ESP_GOTO_ON_ERROR(websocket_send_json_type("start"), cleanup, TAG, "send start failed");
       start_sent = true;
       ESP_LOGI(TAG, "recording started");
@@ -1689,10 +1802,12 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
 
     if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
       if (speech_started && silence_chunks >= VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS) {
+        // 用户说完后一段静音即结束上传。
         ESP_LOGI(TAG, "stop recording after silence: chunks=%lu", (unsigned long)silence_chunks);
         break;
       }
       if (recorded_chunks >= VOICE_UPLOAD_VAD_MAX_RECORD_CHUNKS) {
+        // 限制最长录音，防止 VAD 异常导致无限上传。
         ESP_LOGW(TAG, "stop recording at max chunks: %lu", (unsigned long)recorded_chunks);
         break;
       }
@@ -1701,6 +1816,7 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
 
 cleanup:
   if (start_sent) {
+    // 只在发过 start 的情况下发送 end，保持服务端协议成对。
     esp_err_t end_ret = websocket_send_json_type("end");
     if (ret == ESP_OK && end_ret != ESP_OK) {
       ret = end_ret;
@@ -1718,10 +1834,12 @@ cleanup:
   free(raw);
   free(pcm);
   if (ret == ESP_OK && start_sent) {
+    // 上传完成后等待 ASR/AI/TTS 回复。
     voice_set_state(VOICE_STATE_WAITING_RESPONSE);
     schedule_waiting_response_timeout();
   } else {
     if (!start_sent) {
+      // 未真正开始上传时清除“正在说话”提示。
       lcd_clear_user_speaking();
     }
     voice_set_state(VOICE_STATE_IDLE);
@@ -1729,6 +1847,7 @@ cleanup:
   return ret;
 }
 
+// 空闲监听一块麦克风数据，判断是否满足唤醒并触发自动录音。
 static esp_err_t listen_for_voice_start(int32_t *raw,
                                         int16_t *pcm,
                                         uint32_t *voice_chunks,
@@ -1770,6 +1889,7 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
   }
 
   if (*debug_cooldown_chunks > 0) {
+    // VAD 调试模式下设置冷却期，避免连续触发刷屏。
     --(*debug_cooldown_chunks);
     *voice_chunks = 0;
     *multinet_silence_chunks = 0;
@@ -1782,6 +1902,7 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
 
   bool wake_detected = false;
   if (has_voice) {
+    // 只有 AFE VAD 认为有人声时才喂 MultiNet，减少误触发。
     ++(*voice_chunks);
     *multinet_silence_chunks = 0;
     voice_set_state(VOICE_STATE_VAD_ACTIVE);
@@ -1800,6 +1921,7 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
     wake_detected = voice_multinet_feed(pcm, samples);
   } else {
     if (*voice_chunks > 0 || s_mn_pending_samples > 0) {
+      // 人声后出现静音，累计到阈值后重置命令词上下文。
       ++(*multinet_silence_chunks);
     }
     if (*multinet_silence_chunks >= VOICE_UPLOAD_MULTINET_RESET_SILENCE_CHUNKS) {
@@ -1814,10 +1936,12 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
   }
 
   if (*voice_chunks < VOICE_UPLOAD_VAD_START_CHUNKS) {
+    // 人声持续时间太短时不接受唤醒结果。
     return ESP_OK;
   }
 
   if (!wake_detected) {
+    // 已有人声但还没有命令词，继续监听。
     return ESP_OK;
   }
 
@@ -1833,6 +1957,7 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
   *multinet_silence_chunks = 0;
 
   if (!s_ws_connected) {
+    // 未连接服务端时播报网络错误，不进入录音。
     ESP_LOGW(TAG, "wake phrase ignored because WebSocket is not connected");
     audio_stop_playback();
     voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_NET_ERROR_AND_TRY, false);
@@ -1841,6 +1966,7 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
   }
 
   ESP_LOGI(TAG, "begin auto record after wake phrase");
+  // 新一轮自动录音开始前打断旧播放，清理旧回复残留。
   clear_pending_tts_audio();
   clear_pending_tts_texts();
   audio_stop_playback();
@@ -1859,8 +1985,10 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
   return ret;
 }
 
+// 处理实体按键触发的录音流程。
 static void handle_button_record(void)
 {
+  // 按键录音期间暂停空闲 VAD，避免两条录音路径同时触发。
   s_idle_vad_paused = true;
   voice_multinet_reset();
   esp_err_t err = ESP_OK;
@@ -1872,19 +2000,23 @@ static void handle_button_record(void)
            s_voice_state);
 
   while (key_is_pressed()) {
+    // 等用户松开按键后再开始录音，避免按键噪声进入语音。
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 
   key_event_t stale_event = 0;
   while (key_wait_event(&stale_event, 0)) {
+    // 清掉松手过程中积累的旧事件，避免返回后立刻再次触发。
   }
 
   s_accept_tts = false;
+  // 新录音优先，先停止旧 TTS 播放并清理待接收音频。
   clear_pending_tts_audio();
   clear_pending_tts_texts();
   audio_stop_playback();
 
   if (!s_ws_connected) {
+    // 未连接服务端时直接播报网络错误，不进入录音。
     ESP_LOGW(TAG, "button record ignored because WebSocket is not connected");
     voice_play_wav_prompt(VOICE_UPLOAD_PROMPT_NET_ERROR_AND_TRY, false);
     voice_set_state(VOICE_STATE_IDLE);
@@ -1900,16 +2032,19 @@ static void handle_button_record(void)
   }
 
 cleanup:
+  // 恢复 TTS 接收和空闲 VAD。
   s_accept_tts = true;
   s_idle_vad_paused = false;
 }
 
+// 按键录音任务：轮询按键状态并消费按键事件队列。
 static void voice_upload_task(void *arg)
 {
   (void)arg;
 
   while (true) {
     if (key_is_pressed()) {
+      // 如果任务启动时按键已经按下，直接进入录音处理。
       handle_button_record();
       continue;
     }
@@ -1920,6 +2055,7 @@ static void voice_upload_task(void *arg)
     }
 
     if (event != KEY_EVENT_PRESSED) {
+      // 只关心按下事件，松开事件由 handle_button_record 内部等待处理。
       continue;
     }
 
@@ -1927,6 +2063,7 @@ static void voice_upload_task(void *arg)
   }
 }
 
+// 空闲 VAD 任务：持续监听人声和命令词，触发自动录音。
 static void voice_idle_vad_task(void *arg)
 {
   (void)arg;
@@ -1948,6 +2085,7 @@ static void voice_idle_vad_task(void *arg)
 
   while (true) {
     if (s_idle_vad_paused || key_is_pressed()) {
+      // 手动按键录音优先，暂停自动唤醒监听。
       idle_voice_chunks = 0;
       idle_vad_chunks = 0;
       idle_multinet_silence_chunks = 0;
@@ -1958,6 +2096,7 @@ static void voice_idle_vad_task(void *arg)
     }
 
     if (s_ws_connected) {
+      // 空闲期间也维持心跳，避免服务端断开长连接。
       esp_err_t err = send_heartbeat_if_due(&idle_last_heartbeat_us);
       if (err != ESP_OK) {
         ESP_LOGW(TAG, "idle heartbeat failed: %s", esp_err_to_name(err));
@@ -1965,6 +2104,7 @@ static void voice_idle_vad_task(void *arg)
     }
 
     if (audio_is_playback_active()) {
+      // 播放 TTS 时暂停唤醒监听，避免扬声器声音误触发。
       voice_set_state(VOICE_STATE_SPEAKING);
       idle_voice_chunks = 0;
       idle_vad_chunks = 0;
@@ -1978,6 +2118,7 @@ static void voice_idle_vad_task(void *arg)
     }
 
     if (s_continue_after_tts && s_voice_state == VOICE_STATE_IDLE && s_ws_connected) {
+      // 服务端允许连续对话时，TTS 结束后自动进入下一轮录音。
       s_continue_after_tts = false;
       idle_voice_chunks = 0;
       idle_vad_chunks = 0;
@@ -1995,6 +2136,7 @@ static void voice_idle_vad_task(void *arg)
     }
 
     if (s_voice_state == VOICE_STATE_RECORDING) {
+      // 其他路径正在录音时，本任务只清理状态并等待。
       idle_voice_chunks = 0;
       idle_vad_chunks = 0;
       idle_multinet_silence_chunks = 0;
@@ -2005,6 +2147,7 @@ static void voice_idle_vad_task(void *arg)
     }
 
     if (s_voice_state != VOICE_STATE_IDLE && s_voice_state != VOICE_STATE_VAD_ACTIVE) {
+      // 非录音/播放的异常中间态回到空闲，保持监听循环可恢复。
       voice_set_state(VOICE_STATE_IDLE);
     }
 
@@ -2021,9 +2164,11 @@ static void voice_idle_vad_task(void *arg)
   }
 }
 
+// 初始化语音上传模块、语音模型、后台任务和 WebSocket 监控。
 esp_err_t voice_upload_init(void)
 {
   if (s_initialized) {
+    // 保持初始化幂等，避免重复创建任务和 I2S 通道。
     return ESP_OK;
   }
 
@@ -2034,6 +2179,7 @@ esp_err_t voice_upload_init(void)
   voice_log_model_partition_probe();
   esp_err_t sr_ret = voice_srmodel_init();
   if (sr_ret != ESP_OK) {
+    // 没有模型时仍允许按键录音上传，只禁用本地唤醒能力。
     ESP_LOGW(TAG, "SR model list disabled: %s", esp_err_to_name(sr_ret));
   }
 #if VOICE_UPLOAD_AFE_DEBUG_ENABLE
@@ -2044,6 +2190,7 @@ esp_err_t voice_upload_init(void)
 #endif
   esp_err_t mn_ret = voice_multinet_init();
   if (mn_ret != ESP_OK) {
+    // 记录已经尝试过，后续喂音频时不会反复初始化刷日志。
     s_mn_init_attempted = true;
     ESP_LOGW(TAG, "MultiNet wake disabled: %s", esp_err_to_name(mn_ret));
   }

@@ -1,5 +1,6 @@
 #include "led.h"
 
+// 将 LED 引脚配置为 GPIO 输出，并设置初始熄灭状态。
 void led_init(void)
 {
   gpio_config_t io_conf = {0};
@@ -11,5 +12,6 @@ void led_init(void)
 
   gpio_config(&io_conf);
 
+  // 默认熄灭，后续只由应用逻辑显式改变 LED 状态。
   LED(0);
 }

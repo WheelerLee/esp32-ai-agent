@@ -57,6 +57,7 @@ typedef struct {
 
 static lazy_font_state_t s_lazy_font;
 
+// 在已排序的字形索引中二分查找指定 Unicode 码点。
 static const lazy_font_entry_t *find_entry(const lazy_font_state_t *state, uint32_t code)
 {
   uint32_t left = 0;
@@ -78,6 +79,7 @@ static const lazy_font_entry_t *find_entry(const lazy_font_state_t *state, uint3
   return NULL;
 }
 
+// LVGL 字形描述回调：只返回字形尺寸，不加载位图数据。
 static bool lazy_get_glyph_dsc(const lv_font_t *font,
                                lv_font_glyph_dsc_t *dsc_out,
                                uint32_t unicode_letter,
@@ -91,6 +93,7 @@ static bool lazy_get_glyph_dsc(const lv_font_t *font,
 
   const lazy_font_state_t *state = (const lazy_font_state_t *)font->dsc;
   const lazy_font_entry_t *entry = find_entry(state, unicode_letter);
+  // 找不到字形时交给 LVGL 的备用字体链继续处理。
   if (entry == NULL) {
     return false;
   }
@@ -106,6 +109,7 @@ static bool lazy_get_glyph_dsc(const lv_font_t *font,
   return true;
 }
 
+// LVGL 位图回调：按需读取字形位图，并放入环形缓存。
 static const uint8_t *lazy_get_glyph_bitmap(const lv_font_t *font, uint32_t unicode_letter)
 {
   if (font == NULL || font->dsc == NULL) {
@@ -119,6 +123,7 @@ static const uint8_t *lazy_get_glyph_bitmap(const lv_font_t *font, uint32_t unic
   }
 
   for (size_t i = 0; i < LAZY_FONT_CACHE_COUNT; ++i) {
+    // 同一字形被反复绘制时，直接复用已有缓存。
     if (state->cache[i].valid && state->cache[i].code == unicode_letter) {
       return state->cache[i].bitmap;
     }
@@ -143,6 +148,7 @@ static const uint8_t *lazy_get_glyph_bitmap(const lv_font_t *font, uint32_t unic
   return slot->bitmap;
 }
 
+// 释放当前懒加载字体持有的文件句柄、索引和缓存。
 void lazy_font_unload(void)
 {
   if (s_lazy_font.file != NULL) {
@@ -157,6 +163,7 @@ void lazy_font_unload(void)
   memset(&s_lazy_font, 0, sizeof(s_lazy_font));
 }
 
+// 加载字库头和索引；字形位图仍保留在文件中，绘制时再读取。
 const lv_font_t *lazy_font_load(const char *path, const lv_font_t *fallback)
 {
   if (path == NULL) {
@@ -185,6 +192,7 @@ const lv_font_t *lazy_font_load(const char *path, const lv_font_t *fallback)
       header.glyph_count == 0 ||
       header.index_offset < sizeof(header) ||
       header.bitmap_offset <= header.index_offset) {
+    // 提前拒绝不兼容文件，避免 LVGL 拿到半初始化字体。
     ESP_LOGW(TAG, "unsupported lazy font format: %s", path);
     fclose(file);
     return NULL;
@@ -207,6 +215,7 @@ const lv_font_t *lazy_font_load(const char *path, const lv_font_t *fallback)
 
   uint16_t max_bitmap_size = 0;
   for (uint32_t i = 0; i < header.glyph_count; ++i) {
+    // 缓存槽固定大小，因此按最大字形位图申请空间。
     if (entries[i].bitmap_size > max_bitmap_size) {
       max_bitmap_size = entries[i].bitmap_size;
     }

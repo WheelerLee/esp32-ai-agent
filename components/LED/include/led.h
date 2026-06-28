@@ -20,6 +20,7 @@ enum GPIO_OUTPUT_STATE
   gpio_set_level(LED_GPIO_PIN, !gpio_get_level(LED_GPIO_PIN));  \
 } while (0);
 
+// 配置状态 LED GPIO，并以熄灭状态启动。
 void led_init(void);
 
 #endif
