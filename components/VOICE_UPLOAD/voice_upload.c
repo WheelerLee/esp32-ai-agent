@@ -44,9 +44,12 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_TTS_TEXT_SLOTS 4
 #define VOICE_UPLOAD_IDLE_READ_TIMEOUT_MS 30
 #define VOICE_UPLOAD_VAD_START_CHUNKS 3
+#define VOICE_UPLOAD_RECORD_START_CHUNKS 3
 #define VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS 25
 #define VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS 157
 #define VOICE_UPLOAD_VAD_MAX_RECORD_CHUNKS 938
+#define VOICE_UPLOAD_RECORD_CACHE_CHUNKS 8
+#define VOICE_UPLOAD_RECORD_CACHE_SEND_DELAY_MS 32
 #define VOICE_UPLOAD_SPEAKING_TASK_STACK 2048
 #define VOICE_UPLOAD_RESPONSE_IDLE_TIMEOUT_MS 15000
 #define VOICE_UPLOAD_VAD_DEBUG_ONLY 0
@@ -1195,6 +1198,13 @@ static vad_state_t voice_afe_last_vad_state(void)
   return s_afe_last_vad_state;
 }
 
+// 进入新一轮录音前清掉上一阶段的 VAD 状态，避免唤醒词或 TTS 余波被当成新问题。
+static void voice_afe_reset_vad_state(void)
+{
+  s_afe_last_vad_state = VAD_SILENCE;
+  s_afe_logged_vad_state = VAD_SILENCE;
+}
+
 // 判断 AFE VAD 是否已经初始化可用。
 static bool voice_afe_vad_available(void)
 {
@@ -1680,10 +1690,15 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
   bool start_sent = false;
   int32_t *raw = NULL;
   int16_t *pcm = NULL;
+  int16_t *record_cache_pcm = NULL;
+  size_t *record_cache_samples = NULL;
+  uint32_t record_cache_write = 0;
+  uint32_t record_cache_count = 0;
   int64_t last_heartbeat_us = 0;
   size_t total_pcm_bytes = 0;
   uint32_t recorded_chunks = 0;
   uint32_t silence_chunks = 0;
+  uint32_t record_voice_chunks = 0;
   bool speech_started = false;
 
   if (!wifi_is_connected()) {
@@ -1701,11 +1716,20 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
 
   raw = (int32_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int32_t));
   pcm = (int16_t *)malloc(VOICE_UPLOAD_FRAMES_PER_CHUNK * sizeof(int16_t));
-  if (raw == NULL || pcm == NULL) {
+  record_cache_pcm = (int16_t *)calloc(VOICE_UPLOAD_RECORD_CACHE_CHUNKS *
+                                         VOICE_UPLOAD_FRAMES_PER_CHUNK,
+                                       sizeof(int16_t));
+  record_cache_samples = (size_t *)calloc(VOICE_UPLOAD_RECORD_CACHE_CHUNKS,
+                                          sizeof(size_t));
+  if (raw == NULL || pcm == NULL ||
+      record_cache_pcm == NULL || record_cache_samples == NULL) {
     ret = ESP_ERR_NO_MEM;
     goto cleanup;
   }
 
+#if VOICE_UPLOAD_AFE_DEBUG_ENABLE
+  voice_afe_reset_vad_state();
+#endif
   ESP_LOGI(TAG, "recording armed, waiting for speech");
   last_heartbeat_us = esp_timer_get_time();
 
@@ -1719,6 +1743,21 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
       continue;
     }
     ESP_GOTO_ON_ERROR(ret, cleanup, TAG, "read mic failed");
+
+    bool current_chunk_cached = false;
+    if ((stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) &&
+        !start_sent) {
+      int16_t *slot = record_cache_pcm +
+                      (size_t)record_cache_write * VOICE_UPLOAD_FRAMES_PER_CHUNK;
+      memcpy(slot, pcm, samples * sizeof(int16_t));
+      record_cache_samples[record_cache_write] = samples;
+      record_cache_write =
+        (record_cache_write + 1U) % VOICE_UPLOAD_RECORD_CACHE_CHUNKS;
+      if (record_cache_count < VOICE_UPLOAD_RECORD_CACHE_CHUNKS) {
+        ++record_cache_count;
+      }
+      current_chunk_cached = true;
+    }
 
     if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
       // 静音/按键停止模式下需要实时判断是否已经开始说话。
@@ -1734,12 +1773,22 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
       bool user_voice = has_voice && !playback_active;
       if (user_voice) {
         if (!speech_started) {
-          ESP_LOGI(TAG, "record speech started: chunk=%lu", (unsigned long)recorded_chunks);
+          ++record_voice_chunks;
+          if (record_voice_chunks >= VOICE_UPLOAD_RECORD_START_CHUNKS) {
+            ESP_LOGI(TAG,
+                     "record speech started: chunk=%lu voice_chunks=%lu",
+                     (unsigned long)recorded_chunks,
+                     (unsigned long)record_voice_chunks);
+            speech_started = true;
+          }
+        } else {
+          ++record_voice_chunks;
         }
-        speech_started = true;
         silence_chunks = 0;
       } else if (speech_started) {
         ++silence_chunks;
+      } else {
+        record_voice_chunks = 0;
       }
 
       if (recorded_chunks < 5 ||
@@ -1748,13 +1797,14 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
           (recorded_chunks % VOICE_UPLOAD_RECORD_VAD_LOG_INTERVAL) == 0U) {
         // 开头、状态变化和固定间隔打印 AFE VAD 状态，便于观察录音边界。
         ESP_LOGI(TAG,
-                 "record VAD: chunk=%lu afe_vad=%d voice=%d user_voice=%d playback=%d started=%d silence=%lu",
+                 "record VAD: chunk=%lu afe_vad=%d voice=%d user_voice=%d playback=%d started=%d voice_chunks=%lu silence=%lu",
                  (unsigned long)recorded_chunks,
                  afe_vad,
                  has_voice,
                  user_voice,
                  playback_active,
                  speech_started,
+                 (unsigned long)record_voice_chunks,
                  (unsigned long)silence_chunks);
       }
     }
@@ -1777,11 +1827,35 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
       // 只有检测到真实语音后才发 start，避免服务端收到空请求。
       ESP_GOTO_ON_ERROR(websocket_send_json_type("start"), cleanup, TAG, "send start failed");
       start_sent = true;
-      ESP_LOGI(TAG, "recording started");
+      ESP_LOGI(TAG,
+               "recording started: cached_chunks=%lu",
+               (unsigned long)record_cache_count);
+      for (uint32_t i = 0; i < record_cache_count; ++i) {
+        uint32_t index =
+          (record_cache_write + VOICE_UPLOAD_RECORD_CACHE_CHUNKS -
+           record_cache_count + i) % VOICE_UPLOAD_RECORD_CACHE_CHUNKS;
+        size_t cached_samples = record_cache_samples[index];
+        if (cached_samples == 0) {
+          continue;
+        }
+        int16_t *slot = record_cache_pcm +
+                        (size_t)index * VOICE_UPLOAD_FRAMES_PER_CHUNK;
+        ESP_GOTO_ON_ERROR(websocket_send_bin(slot, cached_samples),
+                          cleanup,
+                          TAG,
+                          "send cached PCM failed");
+        total_pcm_bytes += cached_samples * sizeof(int16_t);
+        if (i + 1U < record_cache_count) {
+          vTaskDelay(pdMS_TO_TICKS(VOICE_UPLOAD_RECORD_CACHE_SEND_DELAY_MS));
+        }
+      }
+      record_cache_count = 0;
     }
 
-    ESP_GOTO_ON_ERROR(websocket_send_bin(pcm, samples), cleanup, TAG, "send PCM failed");
-    total_pcm_bytes += samples * sizeof(int16_t);
+    if (!current_chunk_cached) {
+      ESP_GOTO_ON_ERROR(websocket_send_bin(pcm, samples), cleanup, TAG, "send PCM failed");
+      total_pcm_bytes += samples * sizeof(int16_t);
+    }
 
     if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
       if (speech_started && silence_chunks >= VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS) {
@@ -1818,6 +1892,8 @@ cleanup:
            (unsigned long)recorded_chunks);
   free(raw);
   free(pcm);
+  free(record_cache_pcm);
+  free(record_cache_samples);
   if (ret == ESP_OK && start_sent) {
     // 上传完成后等待 ASR/AI/TTS 回复。
     voice_set_state(VOICE_STATE_WAITING_RESPONSE);
@@ -2087,7 +2163,7 @@ static void voice_idle_vad_task(void *arg)
       idle_multinet_silence_chunks = 0;
       idle_human_voice_log_cooldown_chunks = 0;
       voice_multinet_reset();
-      vTaskDelay(pdMS_TO_TICKS(50));
+      vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     } else if (s_voice_state == VOICE_STATE_SPEAKING) {
       voice_set_state(VOICE_STATE_IDLE);

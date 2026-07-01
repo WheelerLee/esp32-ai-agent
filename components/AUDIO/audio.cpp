@@ -650,6 +650,9 @@ static void audio_pcm_play_task(void *arg)
         int64_t queue_wait_us = write_start_us - item.enqueue_us;
         uint32_t queued_items = uxQueueMessagesWaiting(s_pcm_queue);
         ++played_items;
+        if (queued_items == 0) {
+          s_pcm_playback_active = false;
+        }
         if (played_items <= 2 ||
             queued_items == 0 ||
             (played_items % audio_pcm_play_log_interval) == 0U) {
