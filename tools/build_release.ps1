@@ -15,6 +15,7 @@ $BuildPath = Join-Path $ProjectDir $BuildDir
 $SdkconfigPath = Join-Path $ProjectDir $Sdkconfig
 $DistPath = Join-Path $ProjectDir $DistDir
 $ImagesPath = Join-Path $DistPath "images"
+$OtaPath = Join-Path $DistPath "ota"
 
 function Invoke-Checked {
   param(
@@ -80,6 +81,31 @@ function Convert-OffsetToInt {
   return [Convert]::ToInt64($Offset, 10)
 }
 
+function New-OtaFileEntry {
+  param(
+    [string]$Type,
+    [string]$Partition,
+    [string]$SourcePath,
+    [string]$DestinationName
+  )
+
+  if (-not (Test-Path $SourcePath)) {
+    throw "OTA image missing: $SourcePath"
+  }
+
+  $destinationPath = Join-Path $OtaPath $DestinationName
+  Copy-Item -LiteralPath $SourcePath -Destination $destinationPath
+
+  return [pscustomobject]@{
+    type = $Type
+    partition = $Partition
+    file = $DestinationName
+    url = $DestinationName
+    size = (Get-Item $destinationPath).Length
+    sha256 = Get-FileSha256 $destinationPath
+  }
+}
+
 Push-Location $ProjectDir
 try {
   if (-not (Test-Path $SdkconfigPath)) {
@@ -108,6 +134,7 @@ try {
     Remove-Item -LiteralPath $DistPath -Recurse -Force
   }
   New-Item -ItemType Directory -Path $ImagesPath -Force | Out-Null
+  New-Item -ItemType Directory -Path $OtaPath -Force | Out-Null
 
   Copy-Item -LiteralPath $FlasherArgsPath -Destination (Join-Path $DistPath "flasher_args.json")
   if (Test-Path $FlashArgsPath) {
@@ -158,6 +185,26 @@ try {
 
     Invoke-Esptool $mergeArgs
   }
+
+  $otaFiles = @()
+  if ($flasher.PSObject.Properties.Name -contains "app") {
+    $appImage = Join-Path $BuildPath ([string]$flasher.app.file)
+    $otaFiles += New-OtaFileEntry "app" "ota" $appImage (Split-Path ([string]$flasher.app.file) -Leaf)
+  }
+  if ($flasher.PSObject.Properties.Name -contains "font") {
+    $fontImage = Join-Path $BuildPath ([string]$flasher.font.file)
+    $otaFiles += New-OtaFileEntry "data" "font" $fontImage (Split-Path ([string]$flasher.font.file) -Leaf)
+  }
+  if ($flasher.PSObject.Properties.Name -contains "model") {
+    $modelImage = Join-Path $BuildPath ([string]$flasher.model.file)
+    $otaFiles += New-OtaFileEntry "data" "model" $modelImage (Split-Path ([string]$flasher.model.file) -Leaf)
+  }
+
+  $otaManifest = [pscustomobject]@{
+    newVersion = $true
+    files = $otaFiles
+  }
+  $otaManifest | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $OtaPath "manifest.json")
 
   $manifest = [pscustomobject]@{
     project = Split-Path $ProjectDir -Leaf
@@ -221,6 +268,7 @@ try {
   Write-Host ""
   Write-Host "Release package ready: $DistPath"
   Write-Host "Factory image: $factoryPath"
+  Write-Host "OTA files: $(Join-Path $DistPath 'ota')"
   Write-Host "Flash command: dist\flash_factory.bat"
 } finally {
   Pop-Location
