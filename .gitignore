@@ -12,3 +12,5 @@ sdkconfig.old
 !font_partition/*.bin
 !font_active/*.bin
 *.map
+build-release
+dist/
