@@ -9,6 +9,7 @@
 #include "audio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#include "esp_app_desc.h"
 #include "esp_freertos_hooks.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
@@ -39,6 +40,7 @@ static lv_obj_t *s_home_volume_label;
 static lv_obj_t *s_home_question_label;
 static lv_obj_t *s_home_reply_label;
 static lv_timer_t *s_home_wifi_timer;
+static lv_obj_t *s_app_version_label;
 static lv_obj_t *s_cpu_usage_label;
 static lv_timer_t *s_cpu_usage_timer;
 static lv_obj_t *s_wifi_status_label;
@@ -380,6 +382,20 @@ static lv_obj_t *create_label(lv_obj_t *parent, const char *text, const lv_font_
 // 创建 CPU 使用率标签；键盘打开时上移避免遮挡。
 static void create_cpu_usage_label(bool above_keyboard)
 {
+  const esp_app_desc_t *app_desc = esp_app_get_description();
+  char version_text[32];
+  snprintf(version_text, sizeof(version_text), "版本 %s", app_desc != NULL ? app_desc->version : "--");
+
+  s_app_version_label = create_label(lv_scr_act(), version_text, ui_font());
+  if (s_app_version_label != NULL) {
+    lv_obj_set_width(s_app_version_label, 150);
+    lv_obj_set_style_text_color(s_app_version_label, lv_color_hex(0x64748b), 0);
+    lv_obj_set_style_text_align(s_app_version_label, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(s_app_version_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(s_app_version_label, LV_ALIGN_BOTTOM_LEFT, 6, above_keyboard ? -120 : -22);
+    lv_obj_move_foreground(s_app_version_label);
+  }
+
   s_cpu_usage_label = create_label(lv_scr_act(), "CPU0 --%  CPU1 --%", ui_font());
   if (s_cpu_usage_label == NULL) {
     return;
@@ -784,6 +800,7 @@ static void clear_screen(void)
   lv_obj_clean(lv_scr_act());
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0xf8fafc), 0);
   lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+  s_app_version_label = NULL;
   s_cpu_usage_label = NULL;
 }
 

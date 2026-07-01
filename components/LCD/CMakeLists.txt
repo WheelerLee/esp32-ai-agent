@@ -13,6 +13,7 @@ set(requires
             esp_lcd_ili9341
             esp_lcd_touch
             esp_lcd_touch_xpt2046
+            esp_app_format
             esp_timer
             esp_system
             lvgl
