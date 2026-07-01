@@ -6,10 +6,10 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -22,6 +22,7 @@ static const char *TAG = "app_wifi";
 #define APP_WIFI_PASSWORD_MAX_LEN 64
 #define APP_WIFI_RETRY_DELAY_MS (3 * 1000)
 #define APP_WIFI_MAX_RETRIES 5
+#define APP_WIFI_SCAN_RECORDS_MAX 32
 
 static SemaphoreHandle_t s_status_mutex;
 static esp_netif_t *s_sta_netif;
@@ -34,12 +35,13 @@ static char s_pending_password[APP_WIFI_PASSWORD_MAX_LEN + 1];
 static bool s_pending_save;
 static bool s_suppress_next_disconnect_retry;
 static uint8_t s_retry_count;
-static TaskHandle_t s_retry_task_handle;
+static esp_timer_handle_t s_retry_timer;
 static app_wifi_status_changed_cb_t s_status_changed_cb;
 static void *s_status_changed_user_ctx;
 
 static void schedule_retry(void);
 static void notify_status_changed(void);
+static void retry_timer_cb(void *arg);
 
 // 加锁保护共享 WiFi 状态；初始化早期没有 mutex 时直接跳过。
 static void status_lock(void)
@@ -187,6 +189,8 @@ static esp_err_t connect_with_credentials(const char *ssid,
   if (password != NULL) {
     strlcpy((char *)wifi_config.sta.password, password, sizeof(wifi_config.sta.password));
   }
+  wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+  wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
   wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
   wifi_config.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
 
@@ -223,15 +227,10 @@ static esp_err_t connect_with_credentials(const char *ssid,
   return ESP_OK;
 }
 
-// 延迟重连任务：避免断线瞬间立刻重试导致状态抖动。
-static void retry_task(void *arg)
+// 延迟重连回调：避免断线瞬间立刻重试导致状态抖动。
+static void retry_timer_cb(void *arg)
 {
   (void)arg;
-
-  vTaskDelay(pdMS_TO_TICKS(APP_WIFI_RETRY_DELAY_MS));
-
-  // 先清空任务句柄，失败时 schedule_retry 才能继续创建下一轮任务。
-  s_retry_task_handle = NULL;
 
   if (s_saved_ssid[0] != '\0' && s_retry_count < APP_WIFI_MAX_RETRIES) {
     s_retry_count++;
@@ -246,8 +245,6 @@ static void retry_task(void *arg)
       schedule_retry();
     }
   }
-
-  vTaskDelete(NULL);
 }
 
 // 在有保存凭据且未超过次数限制时安排一次后台重连。
@@ -261,15 +258,18 @@ static void schedule_retry(void)
     ESP_LOGW(TAG, "WiFi retry limit reached, stop reconnecting");
     return;
   }
-  if (s_retry_task_handle != NULL) {
+  if (s_retry_timer == NULL) {
+    ESP_LOGE(TAG, "WiFi retry timer is not ready");
+    return;
+  }
+  if (esp_timer_is_active(s_retry_timer)) {
     // 已有重连任务在等待，避免重复创建。
     return;
   }
 
-  BaseType_t ret = xTaskCreate(retry_task, "wifi_retry", 4096, NULL, 4, &s_retry_task_handle);
-  if (ret != pdPASS) {
-    s_retry_task_handle = NULL;
-    ESP_LOGE(TAG, "create WiFi retry task failed");
+  esp_err_t err = esp_timer_start_once(s_retry_timer, APP_WIFI_RETRY_DELAY_MS * 1000);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    ESP_LOGE(TAG, "start WiFi retry timer failed: %s", esp_err_to_name(err));
   }
 }
 
@@ -315,6 +315,9 @@ static void wifi_event_handler(void *arg,
     ESP_LOGI(TAG, "got IP: " IPSTR, IP2STR(&event->ip_info.ip));
     s_suppress_next_disconnect_retry = false;
     s_retry_count = 0;
+    if (s_retry_timer != NULL && esp_timer_is_active(s_retry_timer)) {
+      esp_timer_stop(s_retry_timer);
+    }
 
     if (s_pending_save) {
       // DHCP 成功后才说明凭据真的可用，此时再写入 NVS。
@@ -337,6 +340,14 @@ esp_err_t app_wifi_init(void)
 
   s_status_mutex = xSemaphoreCreateMutex();
   ESP_RETURN_ON_FALSE(s_status_mutex != NULL, ESP_ERR_NO_MEM, TAG, "create status mutex failed");
+
+  esp_timer_create_args_t retry_timer_args = {
+    .callback = retry_timer_cb,
+    .name = "wifi_retry",
+  };
+  ESP_RETURN_ON_ERROR(esp_timer_create(&retry_timer_args, &s_retry_timer),
+                      TAG,
+                      "create WiFi retry timer failed");
 
   ESP_RETURN_ON_ERROR(init_nvs(), TAG, "NVS init failed");
   ESP_RETURN_ON_ERROR(load_saved_credentials(), TAG, "load saved WiFi credentials failed");
@@ -375,6 +386,7 @@ esp_err_t app_wifi_init(void)
   // 凭据由本组件保存到 NVS，WiFi 驱动只使用 RAM 配置。
   ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "set WiFi storage failed");
   ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start WiFi failed");
+  ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "disable WiFi power save failed");
 
   s_initialized = true;
   if (s_saved_ssid[0] != '\0') {
@@ -409,20 +421,52 @@ esp_err_t app_wifi_scan(app_wifi_ap_record_t *aps, size_t max_aps, size_t *ap_co
     return ESP_OK;
   }
 
-  uint16_t read_count = found > max_aps ? (uint16_t)max_aps : found;
-  wifi_ap_record_t records[APP_WIFI_MAX_APS] = {0};
-  if (read_count > APP_WIFI_MAX_APS) {
-    // 本地临时数组固定为 APP_WIFI_MAX_APS，避免调用者传入过大导致越界。
-    read_count = APP_WIFI_MAX_APS;
+  uint16_t read_count = found > APP_WIFI_SCAN_RECORDS_MAX ? APP_WIFI_SCAN_RECORDS_MAX : found;
+  wifi_ap_record_t records[APP_WIFI_SCAN_RECORDS_MAX] = {0};
+  if (read_count > APP_WIFI_SCAN_RECORDS_MAX) {
+    // 本地临时数组固定为 APP_WIFI_SCAN_RECORDS_MAX，避免调用者传入过大导致越界。
+    read_count = APP_WIFI_SCAN_RECORDS_MAX;
   }
   ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_records(&read_count, records), TAG, "get AP records failed");
 
   for (uint16_t i = 0; i < read_count; ++i) {
-    strlcpy(aps[i].ssid, (const char *)records[i].ssid, sizeof(aps[i].ssid));
-    aps[i].rssi = records[i].rssi;
-    aps[i].authmode = records[i].authmode;
+    const char *ssid = (const char *)records[i].ssid;
+    if (ssid[0] == '\0') {
+      // 隐藏 SSID 无法从当前列表直接连接，避免占用可选网络名额。
+      continue;
+    }
+
+    bool has_existing = false;
+    size_t existing = 0;
+    for (size_t j = 0; j < *ap_count; ++j) {
+      if (strcmp(aps[j].ssid, ssid) == 0 && aps[j].authmode == records[i].authmode) {
+        has_existing = true;
+        existing = j;
+        break;
+      }
+    }
+
+    if (has_existing) {
+      // 同名同加密类型 AP 合并展示，保留信号最强的 BSSID 信息。
+      if (aps[existing].ap_count < UINT8_MAX) {
+        ++aps[existing].ap_count;
+      }
+      if (records[i].rssi > aps[existing].rssi) {
+        aps[existing].rssi = records[i].rssi;
+      }
+      continue;
+    }
+
+    if (*ap_count >= max_aps) {
+      continue;
+    }
+
+    strlcpy(aps[*ap_count].ssid, ssid, sizeof(aps[*ap_count].ssid));
+    aps[*ap_count].rssi = records[i].rssi;
+    aps[*ap_count].ap_count = 1;
+    aps[*ap_count].authmode = records[i].authmode;
+    ++(*ap_count);
   }
-  *ap_count = read_count;
   return ESP_OK;
 }
 

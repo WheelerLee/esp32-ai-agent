@@ -1032,11 +1032,21 @@ static void show_scan_results_locked(void)
 
   for (size_t i = 0; i < s_scan_count; ++i) {
     char row_text[64];
-    snprintf(row_text,
-             sizeof(row_text),
-             "%s  %d dBm",
-             s_scan_results[i].ssid[0] != '\0' ? s_scan_results[i].ssid : "<隐藏>",
-             s_scan_results[i].rssi);
+    const char *ssid = s_scan_results[i].ssid[0] != '\0' ? s_scan_results[i].ssid : "<隐藏>";
+    if (s_scan_results[i].ap_count > 1) {
+      snprintf(row_text,
+               sizeof(row_text),
+               "%s (%u)  %d dBm",
+               ssid,
+               s_scan_results[i].ap_count,
+               s_scan_results[i].rssi);
+    } else {
+      snprintf(row_text,
+               sizeof(row_text),
+               "%s  %d dBm",
+               ssid,
+               s_scan_results[i].rssi);
+    }
     lv_obj_t *row = create_list_row(s_wifi_list,
                                     row_text,
                                     wifi_signal_level_from_rssi(s_scan_results[i].rssi),

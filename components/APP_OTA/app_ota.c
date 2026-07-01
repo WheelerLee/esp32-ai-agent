@@ -17,12 +17,14 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mbedtls/sha256.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 #include "wear_levelling.h"
 
 static const char *TAG = "app_ota";
@@ -39,6 +41,22 @@ static const char *TAG = "app_ota";
 #define APP_OTA_NVS_KEY_PENDING "pending"
 #define APP_OTA_NVS_KEY_COUNT "count"
 #define APP_OTA_MAX_FILES 4
+#define APP_OTA_TASK_WDT_TIMEOUT_MS 30000
+#define APP_OTA_DEFAULT_WDT_TIMEOUT_MS (CONFIG_ESP_TASK_WDT_TIMEOUT_S * 1000)
+#ifndef CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
+#define CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 0
+#endif
+#ifndef CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1
+#define CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1 0
+#endif
+#ifdef CONFIG_ESP_TASK_WDT_PANIC
+#define APP_OTA_TASK_WDT_TRIGGER_PANIC true
+#else
+#define APP_OTA_TASK_WDT_TRIGGER_PANIC false
+#endif
+#define APP_OTA_TASK_WDT_IDLE_MASK \
+  ((CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 ? (1 << 0) : 0) | \
+   (CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1 ? (1 << 1) : 0))
 
 typedef struct {
   mbedtls_sha256_context ctx;
@@ -63,6 +81,38 @@ static bool s_vfs_mounted;
 static wl_handle_t s_vfs_wl_handle = WL_INVALID_HANDLE;
 
 static void app_ota_task(void *arg);
+
+// OTA 写 flash/校验镜像时会长时间进入 cache/flash IPC 临界区，临时放宽 Task WDT。
+static esp_err_t configure_task_wdt(uint32_t timeout_ms)
+{
+  esp_task_wdt_config_t config = {
+    .timeout_ms = timeout_ms,
+    .idle_core_mask = APP_OTA_TASK_WDT_IDLE_MASK,
+    .trigger_panic = APP_OTA_TASK_WDT_TRIGGER_PANIC,
+  };
+  esp_err_t err = esp_task_wdt_reconfigure(&config);
+  if (err == ESP_ERR_INVALID_STATE) {
+    // Task WDT 未启用时不需要处理。
+    return ESP_OK;
+  }
+  return err;
+}
+
+static void relax_task_wdt_for_ota(void)
+{
+  esp_err_t err = configure_task_wdt(APP_OTA_TASK_WDT_TIMEOUT_MS);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "relax task watchdog for OTA failed: %s", esp_err_to_name(err));
+  }
+}
+
+static void restore_task_wdt_after_ota(void)
+{
+  esp_err_t err = configure_task_wdt(APP_OTA_DEFAULT_WDT_TIMEOUT_MS);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "restore task watchdog after OTA failed: %s", esp_err_to_name(err));
+  }
+}
 
 static esp_err_t init_nvs_if_needed(void)
 {
@@ -845,7 +895,9 @@ static void app_ota_task(void *arg)
   free(manifest_json);
 
   if (err == ESP_OK) {
+    relax_task_wdt_for_ota();
     err = perform_update(files, file_count);
+    restore_task_wdt_after_ota();
   }
 
   if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
@@ -919,6 +971,7 @@ esp_err_t app_ota_apply_staged(void)
 {
   app_ota_staged_file_t staged_files[APP_OTA_MAX_FILES] = {0};
   size_t staged_count = 0;
+  esp_err_t ret = ESP_OK;
 
   ESP_RETURN_ON_ERROR(load_staged_files(staged_files, APP_OTA_MAX_FILES, &staged_count),
                       TAG,
@@ -928,7 +981,12 @@ esp_err_t app_ota_apply_staged(void)
   }
 
   ESP_LOGI(TAG, "applying %u staged OTA resource file(s)", (unsigned)staged_count);
-  ESP_RETURN_ON_ERROR(mount_vfs(), TAG, "mount VFS failed");
+  relax_task_wdt_for_ota();
+  ret = mount_vfs();
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "mount VFS failed: %s", esp_err_to_name(ret));
+    goto cleanup;
+  }
 
   for (size_t i = 0; i < staged_count; ++i) {
     esp_err_t err = write_staged_file_to_partition(&staged_files[i].file, staged_files[i].path);
@@ -937,12 +995,20 @@ esp_err_t app_ota_apply_staged(void)
                "apply staged OTA resource failed: partition=%s err=%s",
                staged_files[i].file.partition,
                esp_err_to_name(err));
-      return err;
+      ret = err;
+      goto cleanup;
     }
     remove(staged_files[i].path);
   }
 
-  ESP_RETURN_ON_ERROR(clear_staged_files(), TAG, "clear staged files failed");
+  ret = clear_staged_files();
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "clear staged files failed: %s", esp_err_to_name(ret));
+    goto cleanup;
+  }
   ESP_LOGI(TAG, "staged OTA resources applied");
-  return ESP_OK;
+
+cleanup:
+  restore_task_wdt_after_ota();
+  return ret;
 }

@@ -19,6 +19,7 @@ extern "C" {
 typedef struct {
   char ssid[APP_WIFI_SSID_MAX_LEN + 1];
   int8_t rssi;
+  uint8_t ap_count;
   wifi_auth_mode_t authmode;
 } app_wifi_ap_record_t;
 

@@ -43,8 +43,6 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_WS_RX_BUFFER_BYTES 4096
 #define VOICE_UPLOAD_TTS_TEXT_SLOTS 4
 #define VOICE_UPLOAD_IDLE_READ_TIMEOUT_MS 30
-#define VOICE_UPLOAD_VAD_AVG_THRESHOLD 220
-#define VOICE_UPLOAD_VAD_PEAK_THRESHOLD 900
 #define VOICE_UPLOAD_VAD_START_CHUNKS 3
 #define VOICE_UPLOAD_VAD_END_SILENCE_CHUNKS 25
 #define VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS 157
@@ -52,7 +50,6 @@ static const char *TAG = "voice_upload";
 #define VOICE_UPLOAD_SPEAKING_TASK_STACK 2048
 #define VOICE_UPLOAD_RESPONSE_IDLE_TIMEOUT_MS 15000
 #define VOICE_UPLOAD_VAD_DEBUG_ONLY 0
-#define VOICE_UPLOAD_VAD_PEAK_AVG_RATIO_MAX 5
 #define VOICE_UPLOAD_AFE_DEBUG_ENABLE 1
 #define VOICE_UPLOAD_AFE_LOG_INTERVAL 100
 #define VOICE_UPLOAD_AFE_REF_BUFFER_SAMPLES 2048
@@ -1439,7 +1436,7 @@ static esp_err_t websocket_ensure_connected(void)
       .uri = VOICE_UPLOAD_WS_URI,
       .buffer_size = VOICE_UPLOAD_WS_RX_BUFFER_BYTES,
       .network_timeout_ms = 5000,
-      .reconnect_timeout_ms = 3000,
+      .disable_auto_reconnect = true,
     };
 
     s_ws_client = esp_websocket_client_init(&ws_cfg);
@@ -1496,10 +1493,35 @@ cleanup:
 // 发送一条 WebSocket 文本消息。
 static esp_err_t websocket_send_text(const char *text)
 {
+  if (text == NULL) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!wifi_is_connected() || s_ws_client == NULL || !s_ws_connected) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (s_ws_mutex != NULL) {
+    xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
+  }
+
+  if (!wifi_is_connected() || s_ws_client == NULL || !s_ws_connected) {
+    if (s_ws_mutex != NULL) {
+      xSemaphoreGive(s_ws_mutex);
+    }
+    return ESP_ERR_INVALID_STATE;
+  }
+
   int ret = esp_websocket_client_send_text(s_ws_client,
                                            text,
                                            (int)strlen(text),
                                            VOICE_UPLOAD_SEND_TIMEOUT_TICKS);
+  if (ret < 0) {
+    s_ws_connected = false;
+  }
+
+  if (s_ws_mutex != NULL) {
+    xSemaphoreGive(s_ws_mutex);
+  }
   return ret >= 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -1518,10 +1540,35 @@ static esp_err_t websocket_send_json_type(const char *type)
 // 发送一块 PCM 二进制音频数据。
 static esp_err_t websocket_send_bin(const int16_t *pcm, size_t sample_count)
 {
+  if (pcm == NULL || sample_count == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!wifi_is_connected() || s_ws_client == NULL || !s_ws_connected) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (s_ws_mutex != NULL) {
+    xSemaphoreTake(s_ws_mutex, portMAX_DELAY);
+  }
+
+  if (!wifi_is_connected() || s_ws_client == NULL || !s_ws_connected) {
+    if (s_ws_mutex != NULL) {
+      xSemaphoreGive(s_ws_mutex);
+    }
+    return ESP_ERR_INVALID_STATE;
+  }
+
   int ret = esp_websocket_client_send_bin(s_ws_client,
                                           (const char *)pcm,
                                           (int)(sample_count * sizeof(int16_t)),
                                           VOICE_UPLOAD_SEND_TIMEOUT_TICKS);
+  if (ret < 0) {
+    s_ws_connected = false;
+  }
+
+  if (s_ws_mutex != NULL) {
+    xSemaphoreGive(s_ws_mutex);
+  }
   return ret >= 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -1607,60 +1654,6 @@ static esp_err_t read_mic_pcm_chunk(int32_t *raw,
   return ESP_OK;
 }
 
-// 简单能量 VAD：去直流后用平均绝对值、峰值和峰均比判断人声。
-static bool vad_detect_voice(const int16_t *pcm,
-                             size_t samples,
-                             uint32_t *avg_abs_out,
-                             int16_t *peak_out,
-                             int32_t *dc_out)
-{
-  if (pcm == NULL || samples == 0) {
-    // 无样本时输出清零，方便调用者直接打印调试值。
-    if (avg_abs_out != NULL) {
-      *avg_abs_out = 0;
-    }
-    if (peak_out != NULL) {
-      *peak_out = 0;
-    }
-    if (dc_out != NULL) {
-      *dc_out = 0;
-    }
-    return false;
-  }
-
-  int64_t sum = 0;
-  for (size_t i = 0; i < samples; ++i) {
-    sum += pcm[i];
-  }
-
-  int32_t dc = (int32_t)(sum / (int64_t)samples);
-  uint64_t sum_abs = 0;
-  int16_t peak = 0;
-  for (size_t i = 0; i < samples; ++i) {
-    int32_t centered = (int32_t)pcm[i] - dc;
-    int32_t abs_sample = centered < 0 ? -centered : centered;
-    sum_abs += (uint32_t)abs_sample;
-    if (abs_sample > peak) {
-      peak = (int16_t)abs_sample;
-    }
-  }
-
-  uint32_t avg_abs = (uint32_t)(sum_abs / samples);
-  if (avg_abs_out != NULL) {
-    *avg_abs_out = avg_abs;
-  }
-  if (peak_out != NULL) {
-    *peak_out = peak;
-  }
-  if (dc_out != NULL) {
-    *dc_out = dc;
-  }
-
-  return avg_abs >= VOICE_UPLOAD_VAD_AVG_THRESHOLD &&
-         peak >= VOICE_UPLOAD_VAD_PEAK_THRESHOLD &&
-         (uint32_t)peak <= avg_abs * VOICE_UPLOAD_VAD_PEAK_AVG_RATIO_MAX;
-}
-
 // 到达心跳间隔时向服务端发送 ping。
 static esp_err_t send_heartbeat_if_due(int64_t *last_heartbeat_us)
 {
@@ -1729,10 +1722,6 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
 
     if (stop_mode == RECORD_STOP_BY_SILENCE || stop_mode == RECORD_STOP_BY_KEY) {
       // 静音/按键停止模式下需要实时判断是否已经开始说话。
-      uint32_t avg_abs = 0;
-      int16_t peak = 0;
-      int32_t dc = 0;
-      bool raw_has_voice = vad_detect_voice(pcm, samples, &avg_abs, &peak, &dc);
 #if VOICE_UPLOAD_AFE_DEBUG_ENABLE
       vad_state_t afe_vad = voice_afe_last_vad_state();
       bool has_voice = voice_afe_vad_available() && afe_vad == VAD_SPEECH;
@@ -1757,21 +1746,15 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
           (!speech_started && recorded_chunks == VOICE_UPLOAD_VAD_FIRST_SPEECH_CHUNKS) ||
           silence_chunks == 1 ||
           (recorded_chunks % VOICE_UPLOAD_RECORD_VAD_LOG_INTERVAL) == 0U) {
-        // 开头、状态变化和固定间隔打印 VAD 统计，便于调阈值。
+        // 开头、状态变化和固定间隔打印 AFE VAD 状态，便于观察录音边界。
         ESP_LOGI(TAG,
-                 "record VAD: chunk=%lu afe_vad=%d voice=%d user_voice=%d playback=%d started=%d raw_voice=%d avg=%lu peak=%d ratio=%lu.%lu dc=%ld silence=%lu",
+                 "record VAD: chunk=%lu afe_vad=%d voice=%d user_voice=%d playback=%d started=%d silence=%lu",
                  (unsigned long)recorded_chunks,
                  afe_vad,
                  has_voice,
                  user_voice,
                  playback_active,
                  speech_started,
-                 raw_has_voice,
-                 (unsigned long)avg_abs,
-                 peak,
-                 avg_abs > 0 ? (unsigned long)((uint32_t)peak / avg_abs) : 0UL,
-                 avg_abs > 0 ? (unsigned long)(((uint32_t)peak % avg_abs) * 10U / avg_abs) : 0UL,
-                 (long)dc,
                  (unsigned long)silence_chunks);
       }
     }
@@ -1815,12 +1798,14 @@ static esp_err_t record_and_upload(record_stop_mode_t stop_mode)
   }
 
 cleanup:
-  if (start_sent) {
+  if (start_sent && wifi_is_connected() && s_ws_connected) {
     // 只在发过 start 的情况下发送 end，保持服务端协议成对。
     esp_err_t end_ret = websocket_send_json_type("end");
     if (ret == ESP_OK && end_ret != ESP_OK) {
       ret = end_ret;
     }
+  } else if (start_sent && ret == ESP_OK) {
+    ret = ESP_ERR_INVALID_STATE;
   }
   clear_pending_tts_audio();
   clear_pending_tts_texts();
@@ -1872,10 +1857,6 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
   }
   ESP_RETURN_ON_ERROR(ret, TAG, "read idle mic failed");
 
-  uint32_t avg_abs = 0;
-  int16_t peak = 0;
-  int32_t dc = 0;
-  bool raw_has_voice = vad_detect_voice(pcm, samples, &avg_abs, &peak, &dc);
 #if VOICE_UPLOAD_AFE_DEBUG_ENABLE
   vad_state_t afe_vad = voice_afe_last_vad_state();
   bool has_voice = voice_afe_vad_available() && afe_vad == VAD_SPEECH;
@@ -1908,14 +1889,9 @@ static esp_err_t listen_for_voice_start(int32_t *raw,
     voice_set_state(VOICE_STATE_VAD_ACTIVE);
     if (*human_voice_log_cooldown_chunks == 0) {
       ESP_LOGI(TAG,
-               "human voice detected: afe_vad=%d raw_voice=%d avg=%lu peak=%d ratio=%lu.%lu dc=%ld",
+               "human voice detected: afe_vad=%d voice_chunks=%lu",
                afe_vad,
-               raw_has_voice,
-               (unsigned long)avg_abs,
-               peak,
-               avg_abs > 0 ? (unsigned long)((uint32_t)peak / avg_abs) : 0UL,
-               avg_abs > 0 ? (unsigned long)(((uint32_t)peak % avg_abs) * 10U / avg_abs) : 0UL,
-               (long)dc);
+               (unsigned long)*voice_chunks);
       *human_voice_log_cooldown_chunks = VOICE_UPLOAD_HUMAN_VOICE_LOG_COOLDOWN_CHUNKS;
     }
     wake_detected = voice_multinet_feed(pcm, samples);
